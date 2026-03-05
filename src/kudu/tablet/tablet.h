@@ -393,12 +393,30 @@ class Tablet {
   // underestimate.
   Status GetBytesInAncientDeletedRowsets(int64_t* bytes_in_ancient_deleted_rowsets);
 
+  // Returns the number of bytes potentially used by rowsets that have been migrated
+  // to a secondary storage.
+  //
+  // TODO (araina): Correct the comments here
+  // These checks may not touch on-disk block data if we can determine from the
+  // migrated row count that the rowsets aren't fully migrated, or from the DMS
+  // that the latest update is not considered migrated. If there is no DMS, looks at
+  // the newest redo but doesn't initialize it. As such, since we may miss out
+  // on counting rowsets we haven't initialized yet, this may be an
+  // underestimate.
+  Status GetBytesInMigratedRowsets(int64_t* bytes_in_migrated_rowsets);
+
   // Finds and GCs all fully deleted rowsets that have a maximum op timestamp
   // prior to the current ancient history mark.
   //
   // Returns an error if the metadata update fails. Upon failure, no in-memory
   // state is change.
   Status DeleteAncientDeletedRowsets();
+
+  // Find and purge all fully migrated rowsets that have a maximum op timestamp
+  // prior to the current migration history mark.
+  //
+  // Returns an error if the metadata update fails.
+  Status DeleteMigratedRowsets();
 
   // Return the current number of rowsets in the tablet.
   size_t num_rowsets() const;
@@ -436,6 +454,11 @@ class Tablet {
   // is enabled, which requires the use of a HybridClock.
   // Otherwise, returns false.
   bool GetTabletAncientHistoryMark(Timestamp* ancient_history_mark) const WARN_UNUSED_RESULT;
+
+  // Calculates the migration history mark and returns true iff tablet migration GC
+  // is enabled, which requires the use of a HybridClock.
+  // Otherwise, returns false.
+  bool GetTabletMigrationHistoryMark(Timestamp* migration_history_mark) const WARN_UNUSED_RESULT;
 
   // Calculates history GC options based on properties of the Clock implementation.
   HistoryGcOpts GetHistoryGcOpts() const;

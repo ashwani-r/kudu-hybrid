@@ -245,6 +245,9 @@ class RowSet {
   virtual Status IsDeletedAndFullyAncient(Timestamp ancient_history_mark,
                                           bool* deleted_and_ancient) = 0;
 
+  virtual Status IsFullyMigrated(Timestamp migration_history_mark,
+                                 bool* fully_migrated) = 0;
+
   // Estimate the number of bytes in ancient undo delta stores. This may be an
   // overestimate or an underestimate depending on 'estimate_type,. The argument
   // 'ancient_history_mark' must be valid: it must not be equal to
@@ -507,6 +510,13 @@ class DuplicatingRowSet : public RowSet {
                                   bool* deleted_and_ancient) override {
     DCHECK(deleted_and_ancient);
     *deleted_and_ancient = false;
+    return Status::OK();
+  }
+
+  Status IsFullyMigrated(Timestamp /*migration_history_mark*/,
+                         bool* fully_migrated) override {
+    DCHECK(fully_migrated);
+    *fully_migrated = false;
     return Status::OK();
   }
 

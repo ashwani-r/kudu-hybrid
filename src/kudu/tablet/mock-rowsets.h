@@ -155,6 +155,13 @@ class MockRowSet : public RowSet {
     return Status::OK();
   }
 
+  Status IsFullyMigrated(Timestamp /*migration_history_mark*/,
+                         bool* /*fully_migrated*/) override {
+    LOG(FATAL) << "Unimplemented";
+    return Status::OK();
+  }
+
+
   Status EstimateBytesInPotentiallyAncientUndoDeltas(Timestamp /*ancient_history_mark*/,
                                                      EstimateType /*estimate_type*/,
                                                      int64_t* /*bytes*/) override {

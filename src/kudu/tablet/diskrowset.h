@@ -433,6 +433,9 @@ class DiskRowSet :
   Status IsDeletedAndFullyAncient(Timestamp ancient_history_mark,
                                   bool* deleted_and_ancient) override;
 
+  Status IsFullyMigrated(Timestamp migration_history_mark,
+                         bool* fully_migrated) override;
+
   Status InitUndoDeltas(Timestamp ancient_history_mark,
                         MonoTime deadline,
                         const fs::IOContext* io_context,

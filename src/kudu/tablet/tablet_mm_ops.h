@@ -197,6 +197,39 @@ class DeletedRowsetGCOp : public TabletOpBase {
   DISALLOW_COPY_AND_ASSIGN(DeletedRowsetGCOp);
 };
 
+// MaintenanceOp to garbage-collect entire rowsets that are fully migrated and
+// older than the last PIT marker.
+class MigratedRowsetGCOp : public TabletOpBase {
+ public:
+  explicit MigratedRowsetGCOp(Tablet* tablet);
+
+  // Estimate the number of bytes from rowsets that have been fully migrated and
+  // exist entirely before the last PIT snapshot of migration (i.e. their most recent
+  // update happened before the PIT snapshot).
+  void UpdateStats(MaintenanceOpStats* stats) override;
+
+  // If this op is already running, we shouldn't run it again.
+  bool Prepare() override {
+    bool false_ref = false;
+    return running_.compare_exchange_strong(false_ref, true);
+  }
+
+  // Deletes migrated rowsets (older than last PIT snapshot) from disk.
+  void Perform() override;
+
+  // Metrics for this op.
+  scoped_refptr<Histogram> DurationHistogram() const override;
+  scoped_refptr<AtomicGauge<uint32_t> > RunningGauge() const override;
+ private:
+  std::string LogPrefix() const;
+
+  // Used to ensure only a single instance of this op is scheduled per tablet
+  // at a time.
+  std::atomic<bool> running_;
+
+  DISALLOW_COPY_AND_ASSIGN(MigratedRowsetGCOp);
+};
+
 } // namespace tablet
 } // namespace kudu
 

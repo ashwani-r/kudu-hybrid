@@ -5374,6 +5374,58 @@ TEST_F(ClientTest, TestBasicAlterOperations) {
     ASSERT_FALSE(tablet_replica->tablet()->metadata()->extra_config()->has_history_max_age_sec());
   }
 
+  // Test altering migration timestamp.
+  // 1. Set migration timestamp to 1000000.
+  {
+    map<string, string> extra_configs;
+    extra_configs["kudu.table.migration_timestamp"] = "1000000";
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterExtraConfig(extra_configs);
+    ASSERT_OK(table_alterer->Alter());
+    ASSERT_EQ(12, tablet_replica->tablet()->metadata()->schema_version());
+    ASSERT_NE(nullopt, tablet_replica->tablet()->metadata()->extra_config());
+    ASSERT_TRUE(tablet_replica->tablet()->metadata()->extra_config()->has_migration_timestamp());
+    ASSERT_EQ(1000000, tablet_replica->tablet()->metadata()->extra_config()->migration_timestamp());
+  }
+  // 2. Update migration timestamp to 2000000.
+  {
+    map<string, string> extra_configs;
+    extra_configs["kudu.table.migration_timestamp"] = "2000000";
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterExtraConfig(extra_configs);
+    ASSERT_OK(table_alterer->Alter());
+    ASSERT_EQ(13, tablet_replica->tablet()->metadata()->schema_version());
+    ASSERT_NE(nullopt, tablet_replica->tablet()->metadata()->extra_config());
+    ASSERT_TRUE(tablet_replica->tablet()->metadata()->extra_config()->has_migration_timestamp());
+    ASSERT_EQ(2000000, tablet_replica->tablet()->metadata()->extra_config()->migration_timestamp());
+  }
+  // 3. Attempt an invalid migration timestamp value.
+  {
+    map<string, string> extra_configs;
+    extra_configs["kudu.table.migration_timestamp"] = "not_a_number";
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterExtraConfig(extra_configs);
+    auto s = table_alterer->Alter();
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "unable to parse kudu.table.migration_timestamp");
+    // Schema version and existing properties are unchanged.
+    ASSERT_EQ(13, tablet_replica->tablet()->metadata()->schema_version());
+    ASSERT_TRUE(tablet_replica->tablet()->metadata()->extra_config()->has_migration_timestamp());
+    ASSERT_EQ(2000000, tablet_replica->tablet()->metadata()->extra_config()->migration_timestamp());
+  }
+  // 4. Reset migration timestamp to default.
+  {
+    map<string, string> extra_configs;
+    extra_configs["kudu.table.migration_timestamp"] = "";
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterExtraConfig(extra_configs);
+    ASSERT_OK(table_alterer->Alter());
+    ASSERT_EQ(14, tablet_replica->tablet()->metadata()->schema_version());
+    ASSERT_NE(nullopt, tablet_replica->tablet()->metadata()->extra_config());
+    ASSERT_FALSE(tablet_replica->tablet()->metadata()->extra_config()->has_migration_timestamp());
+  }
+
   // Test changing a table name.
   {
     const char *kRenamedTableName = "RenamedTable";
@@ -5381,7 +5433,7 @@ TEST_F(ClientTest, TestBasicAlterOperations) {
     ASSERT_OK(table_alterer
               ->RenameTo(kRenamedTableName)
               ->Alter());
-    ASSERT_EQ(12, tablet_replica->tablet()->metadata()->schema_version());
+    ASSERT_EQ(15, tablet_replica->tablet()->metadata()->schema_version());
     ASSERT_EQ(kRenamedTableName, tablet_replica->tablet()->metadata()->table_name());
 
     CatalogManager *catalog_manager = cluster_->mini_master()->master()->catalog_manager();

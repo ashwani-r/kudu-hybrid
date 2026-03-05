@@ -82,6 +82,13 @@ DEFINE_bool(enable_deleted_rowset_gc, true,
     "considered ancient history (see --tablet_history_max_age_sec) are deleted.");
 TAG_FLAG(enable_deleted_rowset_gc, runtime);
 
+DEFINE_bool(enable_migrated_rowset_gc, true,
+    "Whether to enable garbage collection of fully migrated rowsets. Disabling "
+    "migrated rowset garbage collection may increase disk space usage for workloads "
+    "that involve a high number of deletes. Only migrated rowsets that are entirely "
+    "considered migrated to a different storage are deleted.");
+TAG_FLAG(enable_migrated_rowset_gc, runtime);
+
 DEFINE_bool(enable_workload_score_for_perf_improvement_ops, false,
             "Whether to enable prioritization of maintenance operations based on "
             "whether there are on-going workloads, favoring ops of 'hot' tablets.");
@@ -468,6 +475,51 @@ scoped_refptr<AtomicGauge<uint32_t>> DeletedRowsetGCOp::RunningGauge() const {
 }
 
 std::string DeletedRowsetGCOp::LogPrefix() const {
+  return tablet_->LogPrefix();
+}
+
+MigratedRowsetGCOp::MigratedRowsetGCOp(Tablet* tablet)
+    : TabletOpBase(Substitute("MigratedRowsetGCOp($0)", tablet->tablet_id()),
+                   MaintenanceOp::HIGH_IO_USAGE, tablet),
+      running_(false) {
+}
+
+void MigratedRowsetGCOp::UpdateStats(MaintenanceOpStats* stats) {
+  if (!FLAGS_enable_migrated_rowset_gc) {
+    stats->set_runnable(false);
+    LOG(INFO) << Substitute("Migration is not enabled");
+    return;
+  }
+  if (running_.load()) {
+    VLOG(1) << LogPrefix() << " not updating stats: already running";
+    stats->set_runnable(false);
+    return;
+  }
+  int64_t estimated_retained_bytes = 0;
+  WARN_NOT_OK(tablet_->GetBytesInMigratedRowsets(&estimated_retained_bytes),
+              "Unable to count bytes in migrated rowsets");
+  stats->set_data_retained_bytes(estimated_retained_bytes);
+  stats->set_runnable(estimated_retained_bytes > 0);
+  if (estimated_retained_bytes > 0) {
+    LOG(INFO) << "Bytes help by migrated rowsets: " << estimated_retained_bytes;
+  }
+}
+
+void MigratedRowsetGCOp::Perform() {
+  WARN_NOT_OK(tablet_->DeleteMigratedRowsets(),
+      Substitute("$0GC of deleted rowsets failed", LogPrefix()));
+  running_.store(false);
+}
+
+scoped_refptr<Histogram> MigratedRowsetGCOp::DurationHistogram() const {
+  return tablet_->metrics()->deleted_rowset_gc_duration;
+}
+
+scoped_refptr<AtomicGauge<uint32_t>> MigratedRowsetGCOp::RunningGauge() const {
+  return tablet_->metrics()->deleted_rowset_gc_running;
+}
+
+std::string MigratedRowsetGCOp::LogPrefix() const {
   return tablet_->LogPrefix();
 }
 

@@ -157,6 +157,17 @@ TAG_FLAG(tablet_history_max_age_sec, advanced);
 TAG_FLAG(tablet_history_max_age_sec, runtime);
 TAG_FLAG(tablet_history_max_age_sec, stable);
 
+DEFINE_uint64(tablet_migration_timestamp, 0,
+              "HybridClock timestamp (as a raw uint64) used as the migration "
+              "history mark. Rowsets whose most recent mutation falls before "
+              "this timestamp are considered fully migrated and eligible for "
+              "deletion. A value of 0 disables migration GC. Can be overridden "
+              "per-table via the 'kudu.table.migration_timestamp' extra config. "
+              "Equivalent to checksum_snapshot_timestamp in format.");
+TAG_FLAG(tablet_migration_timestamp, advanced);
+TAG_FLAG(tablet_migration_timestamp, runtime);
+TAG_FLAG(tablet_migration_timestamp, stable);
+
 // Large encoded keys cause problems because we store the min/max encoded key in the
 // CFile footer for the composite key column. The footer has a max length of 64K, so
 // the default here comfortably fits two of them with room for other metadata.
@@ -1547,6 +1558,21 @@ bool Tablet::GetTabletAncientHistoryMark(Timestamp* ancient_history_mark) const 
   return true;
 }
 
+bool Tablet::GetTabletMigrationHistoryMark(Timestamp* migration_history_mark) const {
+  uint64_t migration_timestamp = FLAGS_tablet_migration_timestamp;
+  const auto& extra_config = metadata_->extra_config();
+  if (extra_config && extra_config->has_migration_timestamp()) {
+    // Per-table config overrides the global flag.
+    migration_timestamp = extra_config->migration_timestamp();
+  }
+  // A value of 0 means migration GC is disabled. Also requires HybridClock.
+  if (!clock_->HasPhysicalComponent() || migration_timestamp == 0) {
+    return false;
+  }
+  *migration_history_mark = Timestamp(migration_timestamp);
+  return true;
+}
+
 HistoryGcOpts Tablet::GetHistoryGcOpts() const {
   Timestamp ancient_history_mark;
   if (GetTabletAncientHistoryMark(&ancient_history_mark)) {
@@ -1942,6 +1968,9 @@ void Tablet::RegisterMaintenanceOps(MaintenanceManager* maint_mgr) {
     maintenance_ops.emplace_back(new DeletedRowsetGCOp(this));
     maint_mgr->RegisterOp(maintenance_ops.back().get());
   }
+
+  maintenance_ops.emplace_back(new MigratedRowsetGCOp(this));
+  maint_mgr->RegisterOp(maintenance_ops.back().get());
 
   std::lock_guard l(state_lock_);
   maintenance_ops_ = std::move(maintenance_ops);
@@ -3061,6 +3090,36 @@ Status Tablet::GetBytesInAncientDeletedRowsets(int64_t* bytes_in_ancient_deleted
   return Status::OK();
 }
 
+Status Tablet::GetBytesInMigratedRowsets(int64_t* bytes_in_migrated_rowsets) {
+  Timestamp migration_history_mark;
+  if (!Tablet::GetTabletMigrationHistoryMark(&migration_history_mark)) {
+    VLOG_WITH_PREFIX(1) << "Cannot get migration history mark. "
+                           "The clock is likely not a hybrid clock";
+    *bytes_in_migrated_rowsets = 0;
+    return Status::OK();
+  }
+
+  scoped_refptr<TabletComponents> comps;
+  GetComponents(&comps);
+  int64_t bytes = 0;
+  {
+    std::lock_guard csl(compact_select_lock_);
+    for (const auto& rowset : comps->rowsets->all_rowsets()) {
+      if (!rowset->IsAvailableForCompaction()) {
+        continue;
+      }
+      bool fully_migrated = false;
+      RETURN_NOT_OK(rowset->IsFullyMigrated(migration_history_mark, &fully_migrated));
+      if (fully_migrated) {
+        bytes += rowset->OnDiskSize();
+      }
+    }
+  }
+  //metrics_->deleted_rowset_estimated_retained_bytes->set_value(bytes);
+  *bytes_in_migrated_rowsets = bytes;
+  return Status::OK();
+}
+
 Status Tablet::DeleteAncientDeletedRowsets() {
   RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
   const MonoTime start_time = MonoTime::Now();
@@ -3107,6 +3166,50 @@ Status Tablet::DeleteAncientDeletedRowsets() {
       to_delete, TabletMetadata::kNoMrsFlushed, {}));
   metrics_->deleted_rowset_gc_bytes_deleted->IncrementBy(bytes_deleted);
   metrics_->deleted_rowset_gc_duration->Increment((MonoTime::Now() - start_time).ToMilliseconds());
+  return Status::OK();
+}
+
+Status Tablet::DeleteMigratedRowsets() {
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
+  Timestamp migration_history_mark;
+  if (!Tablet::GetTabletMigrationHistoryMark(&migration_history_mark)) {
+    VLOG_WITH_PREFIX(1) << "Cannot get migration history mark. "
+                           "The clock is likely not a hybrid clock";
+    return Status::OK();
+  }
+
+  scoped_refptr<TabletComponents> comps;
+  GetComponents(&comps);
+
+  // We'll take our the rowsets' locks to ensure we don't GC the rowsets while
+  // they're being compacted.
+  RowSetVector to_delete;
+  vector<std::unique_lock<std::mutex>> rowset_locks;
+  {
+    std::lock_guard csl(compact_select_lock_);
+    for (const auto& rowset : comps->rowsets->all_rowsets()) {
+      // Check if this rowset has been locked by a compaction. If so, we
+      // shouldn't attempt to delete it.
+      if (!rowset->IsAvailableForCompaction()) {
+        continue;
+      }
+      bool fully_migrated = false;
+      RETURN_NOT_OK(rowset->IsFullyMigrated(migration_history_mark, &fully_migrated));
+      if (fully_migrated) {
+        // If we intend on deleting the rowset, take its lock so concurrent
+        // compactions don't try to select it for compactions.
+        std::unique_lock l(*rowset->compact_flush_lock(), std::try_to_lock);
+        CHECK(l.owns_lock());
+        to_delete.emplace_back(rowset);
+        rowset_locks.emplace_back(std::move(l));
+      }
+    }
+  }
+  if (to_delete.empty()) {
+    return Status::OK();
+  }
+  RETURN_NOT_OK(HandleEmptyCompactionOrFlush(
+      to_delete, TabletMetadata::kNoMrsFlushed, {}));
   return Status::OK();
 }
 

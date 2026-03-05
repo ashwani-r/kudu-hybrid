@@ -515,6 +515,12 @@ message TableExtraConfigPB {
 
   // If set true, the table's data on disk is not compacted.
   optional bool disable_compaction = 3;
+
+  // HybridClock timestamp (raw uint64) used as the migration history mark for
+  // tablets in this table. Rowsets whose most recent mutation falls before this
+  // timestamp are considered fully migrated and eligible for deletion. A value
+  // of 0 disables migration GC. Equivalent to --tablet_migration_timestamp.
+  optional uint64 migration_timestamp = 4;
 }
 
 // The type of a given table. This is useful in determining whether a

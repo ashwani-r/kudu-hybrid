@@ -416,6 +416,13 @@ class MemRowSet : public RowSet,
     return Status::OK();
   }
 
+  Status IsFullyMigrated(Timestamp /*migration_history_mark*/,
+                         bool* fully_migrated) override {
+    DCHECK(fully_migrated);
+    *fully_migrated = false;
+    return Status::OK();
+  }
+
   Status InitUndoDeltas(Timestamp /*ancient_history_mark*/,
                         MonoTime /*deadline*/,
                         const fs::IOContext* /*io_context*/,

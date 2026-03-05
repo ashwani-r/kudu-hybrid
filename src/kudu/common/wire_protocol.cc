@@ -736,6 +736,14 @@ Status ParseInt32Config(const string& name, const string& value, int32_t* result
   return Status::OK();
 }
 
+Status ParseUInt64Config(const string& name, const string& value, uint64_t* result) {
+  CHECK(result);
+  if (!safe_strtou64(value, result)) {
+    return Status::InvalidArgument(Substitute("unable to parse $0", name), value);
+  }
+  return Status::OK();
+}
+
 Status ParseBoolConfig(const string& name, const string& value, bool* result) {
   CHECK(result);
   bool true_flag = iequals(value, "TRUE");
@@ -750,7 +758,8 @@ Status ParseBoolConfig(const string& name, const string& value, bool* result) {
 Status ExtraConfigPBFromPBMap(const Map<string, string>& configs, TableExtraConfigPB* pb) {
   static const unordered_set<string> kSupportedConfigs({kTableHistoryMaxAgeSec,
                                                         kTableMaintenancePriority,
-                                                        kTableDisableCompaction});
+                                                        kTableDisableCompaction,
+                                                        kTableMigrationTimestamp});
   TableExtraConfigPB result;
   for (const auto& config : configs) {
     const string& name = config.first;
@@ -778,6 +787,12 @@ Status ExtraConfigPBFromPBMap(const Map<string, string>& configs, TableExtraConf
         RETURN_NOT_OK(ParseBoolConfig(name, value, &disable_compaction));
         result.set_disable_compaction(disable_compaction);
       }
+    } else if (name == kTableMigrationTimestamp) {
+      if (!value.empty()) {
+        uint64_t migration_timestamp;
+        RETURN_NOT_OK(ParseUInt64Config(name, value, &migration_timestamp));
+        result.set_migration_timestamp(migration_timestamp);
+      }
     } else {
       LOG(FATAL) << "Unknown extra configuration property: " << name;
     }
@@ -796,6 +811,9 @@ Status ExtraConfigPBToPBMap(const TableExtraConfigPB& pb, Map<string, string>* c
   }
   if (pb.has_disable_compaction()) {
     result[kTableDisableCompaction] = std::to_string(pb.disable_compaction());
+  }
+  if (pb.has_migration_timestamp()) {
+    result[kTableMigrationTimestamp] = std::to_string(pb.migration_timestamp());
   }
   *configs = std::move(result);
   return Status::OK();

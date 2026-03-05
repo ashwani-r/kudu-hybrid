@@ -923,6 +923,12 @@ Status DiskRowSet::IsDeletedAndFullyAncient(Timestamp ancient_history_mark,
   return Status::OK();
 }
 
+Status DiskRowSet::IsFullyMigrated(Timestamp migration_history_mark,
+                                   bool* fully_migrated) {
+  *fully_migrated = delta_tracker_->EstimateAllRedosAreMigrated(migration_history_mark);
+  return Status::OK();
+}
+
 Status DiskRowSet::InitUndoDeltas(Timestamp ancient_history_mark,
                                   MonoTime deadline,
                                   const IOContext* io_context,

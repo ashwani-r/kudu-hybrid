@@ -186,6 +186,8 @@ class DeltaTracker {
   // initted, this will return a false negative.
   bool EstimateAllRedosAreAncient(Timestamp ancient_history_mark);
 
+  bool EstimateAllRedosAreMigrated(Timestamp migration_history_mark);
+
   // See RowSet::InitUndoDeltas().
   Status InitUndoDeltas(Timestamp ancient_history_mark,
                         MonoTime deadline,

@@ -505,6 +505,40 @@ bool DeltaTracker::EstimateAllRedosAreAncient(Timestamp ancient_history_mark) {
       newest_redo->delta_stats().max_timestamp() < ancient_history_mark;
 }
 
+bool DeltaTracker::EstimateAllRedosAreMigrated(Timestamp migration_history_mark) {
+  std::lock_guard lock(component_lock_);
+  const std::optional<Timestamp> dms_highest_timestamp =
+      dms_ ? dms_->highest_timestamp() : std::nullopt;
+  if (dms_highest_timestamp) {
+    return *dms_highest_timestamp < migration_history_mark;
+  }
+
+  // If we don't have a DMS or our DMS hasn't been written to at all, look at
+  // the newest redo store.
+  if (!redo_delta_stores_.empty()) {
+    const auto& newest_redo = redo_delta_stores_.back();
+    return newest_redo->has_delta_stats() &&
+        newest_redo->delta_stats().max_timestamp() < migration_history_mark;
+  }
+
+  // No redo deltas at all (e.g. a freshly compacted rowset with no subsequent
+  // updates). Unlike EstimateAllRedosAreAncient, which is only ever called on
+  // "deleted" rowsets that by definition have redo deltas, this function is
+  // called on any rowset. Fall back to the newest undo store (undos are kept
+  // in descending timestamp order, so front() is the newest). If the most
+  // recent insert predates the migration mark, the rowset's data is entirely
+  // old and it is eligible for purge.
+  if (!undo_delta_stores_.empty()) {
+    const auto& newest_undo = undo_delta_stores_.front();
+    return newest_undo->has_delta_stats() &&
+        newest_undo->delta_stats().max_timestamp() < migration_history_mark;
+  }
+
+  // No evidence of rowset's latest timestamp older than migration time.
+  // i.e. purge needs to be skipped for this rowset.
+  return false;
+}
+
 Status DeltaTracker::EstimateBytesInPotentiallyAncientUndoDeltas(
     Timestamp ancient_history_mark,
     RowSet::EstimateType estimate_type,
