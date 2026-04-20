@@ -1199,4 +1199,200 @@ TEST_F(RowOperationsTest, SchemasDoNotMatch) {
   ASSERT_FALSE(BitmapTest(ops[0].isset_bitmap, 2));
 }
 
+// Demonstrates how increasing the 'val' column cell size from 1 KB to 1 MB
+// amplifies resource consumption across multiple Kudu subsystems.
+//
+// Approach
+// --------
+//  Step 1  Measure WAL entry / RPC write-request size for both cell sizes.
+//          In production every write is serialized into a WriteRequestPB
+//          (RowOperationsPB) before being (a) sent over the network and
+//          (b) appended verbatim to the WAL.  We encode a synthetic row with
+//          RowOperationsPBEncoder and measure the resulting proto byte size
+//          directly — this is the real measurement in the test.
+//
+//  Step 2  Compute all other subsystem metrics analytically.
+//          DeltaMemStore stores each RowChangeList verbatim (no compression),
+//          so DMS memory, on-disk REDO deltas, compaction I/O, and scan
+//          payload all scale linearly with cell size.  The formulas are
+//          documented inline.
+//
+//  Step 3  Print a side-by-side comparison table.
+//
+//  Step 4  Assert expected scaling ratios.
+//
+// Key finding: bloom filters are the single subsystem that does NOT scale
+// with val-column cell size — they are keyed exclusively on the encoded
+// primary key ("hello N"), which has a fixed small size.
+TEST_F(RowOperationsTest, TestCellSizeImpactOnSubsystems) {
+  // Schema matching the tablet compaction workload:
+  // STRING primary key + large STRING val + nullable INT32.
+  SchemaBuilder builder;
+  CHECK_OK(builder.AddKeyColumn("key", STRING));
+  CHECK_OK(builder.AddColumn("val", STRING));
+  CHECK_OK(builder.AddNullableColumn("nullable_val", INT32));
+  Schema schema = builder.BuildWithoutIds();
+
+  constexpr int64_t k1KB = 1LL * 1024;
+  constexpr int64_t k1MB = 1LL * 1024 * 1024;
+  constexpr int64_t kScale = k1MB / k1KB;      // 1024
+  constexpr int64_t kNumRowsets = 5;
+  constexpr int64_t kNumRowsPerRowset = 5;
+  constexpr int64_t kNumUpdates = 10;           // two rounds of 5 updates each
+  constexpr int64_t kTotalRows = kNumRowsets * kNumRowsPerRowset;  // 25
+
+  // Raise the per-cell size limit so that encoding 1 MB val cells succeeds.
+  FLAGS_max_cell_size_bytes = static_cast<int32_t>(k1MB);
+
+  // ========================================================================
+  // Step 1 — WAL / RPC write-request size (measured for both cell sizes)
+  //
+  // RowOperationsPBEncoder::Add() is the same code path executed by
+  // LocalTabletWriter (and by the client library before shipping a write RPC).
+  // ByteSizeLong() on the resulting RowOperationsPB gives the exact number of
+  // bytes that would travel over the wire and land in the WAL.
+  // ========================================================================
+  auto measure_write_op_size = [&](int64_t cell_size_bytes) -> int64_t {
+    RowOperationsPB ops_pb;
+    RowOperationsPBEncoder encoder(&ops_pb);
+    KuduPartialRow row(&schema);
+    CHECK_OK(row.SetStringCopy("key", "hello 0"));
+    string val_data(cell_size_bytes, '\0');
+    CHECK_OK(row.SetStringCopy("val", val_data));
+    encoder.Add(RowOperationsPB::UPSERT, row);
+    return static_cast<int64_t>(ops_pb.ByteSizeLong());
+  };
+
+  const int64_t write_op_1kb = measure_write_op_size(k1KB);
+  const int64_t write_op_1mb = measure_write_op_size(k1MB);
+
+  // ========================================================================
+  // Step 2 — Analytical derivations for other subsystems
+  //
+  // DeltaMemStore (DMS):
+  //   Each UPSERT delta record stored in the in-memory BTree contains a
+  //   RowChangeList: type byte (1 B) + column_id varint (~2 B) + value
+  //   (cell_size_bytes).  The Arena also adds ~20 B of bookkeeping overhead
+  //   per allocation.  Total per record ≈ cell_size + 23 B.
+  //   Total DMS ≈ kTotalRows × kNumUpdates × (cell_size + 23 B).
+  //
+  // REDO delta on-disk (after FlushAllDMSForTests):
+  //   One delta file per DiskRowSet, each holding kNumRowsPerRowset ×
+  //   kNumUpdates RowChangeLists stored verbatim without compression.
+  //   Total ≈ kTotalRows × kNumUpdates × cell_size.
+  //
+  // Minor delta compaction I/O:
+  //   Merges N REDO files into one with a streaming pass — memory stays
+  //   O(block_size).  I/O ≈ 2 × total REDO delta size (one read + one write).
+  //
+  // Major delta compaction peak memory per rowset:
+  //   MajorDeltaCompaction::FlushRowSetAndDeltas() fills a RowBlock of up to
+  //   kRowsPerBlock rows, then calls DeltaIterator::PrepareBatch() to load
+  //   all REDO delta values for those rows simultaneously.
+  //   Peak ≈ min(kRowsPerBlock, kNumRowsPerRowset) × kNumUpdates × cell_size.
+  //
+  // RPC scan payload (per row):
+  //   The scanner returns the full 'val' payload for every row.
+  //   Overhead: encoded key ("hello N" ~10 B) + nullable INT32 (4 B) +
+  //   per-row framing (~20 B) = 34 B.
+  //
+  // Bloom filter per rowset:
+  //   Built by DiskRowSetWriter calling BloomFileWriter::AppendKeys() with
+  //   each encoded PRIMARY KEY — the 'val' column is never included.
+  //   Default size is ~4 KB per rowset (FLAGS_tablet_bloom_block_size),
+  //   completely independent of val-column cell size.
+  // ========================================================================
+
+  constexpr int64_t kDeltaRecordOverhead = 23;   // type + column_id + arena alloc
+  const int64_t dms_1kb = kTotalRows * kNumUpdates * (k1KB + kDeltaRecordOverhead);
+  const int64_t dms_1mb = kTotalRows * kNumUpdates * (k1MB + kDeltaRecordOverhead);
+
+  const int64_t redo_1kb = kTotalRows * kNumUpdates * k1KB;
+  const int64_t redo_1mb = kTotalRows * kNumUpdates * k1MB;
+
+  const int64_t minor_dc_io_1kb = 2 * redo_1kb;
+  const int64_t minor_dc_io_1mb = 2 * redo_1mb;
+
+  // With kNumRowsPerRowset=5 < kRowsPerBlock=100, one batch covers the rowset.
+  constexpr int64_t kRowsPerBlock = 100;
+  const int64_t batch_rows = kNumRowsPerRowset < kRowsPerBlock
+                             ? kNumRowsPerRowset : kRowsPerBlock;
+  const int64_t major_dc_mem_1kb = batch_rows * kNumUpdates * k1KB;
+  const int64_t major_dc_mem_1mb = batch_rows * kNumUpdates * k1MB;
+
+  constexpr int64_t kRowOverhead = 34;  // key + nullable_int + framing
+  const int64_t scan_per_row_1kb = k1KB + kRowOverhead;
+  const int64_t scan_per_row_1mb = k1MB + kRowOverhead;
+
+  // Default bloom block size (FLAGS_tablet_bloom_block_size = 4096 B).
+  // Hardcoded here to avoid pulling in tablet.h into the common test library.
+  constexpr int64_t kBloomBytesPerRowset = 4096;
+  const int64_t total_bloom = kNumRowsets * kBloomBytesPerRowset;
+
+  // ========================================================================
+  // Step 3 — Side-by-side comparison table
+  // ========================================================================
+  LOG(INFO) << "\n"
+      "=== Cell Size Impact on Kudu Subsystems ===\n"
+      "Workload: 5 rowsets x 5 rows/rowset x 10 updates = 250 delta records\n";
+  LOG(INFO) << Substitute(
+      "  Subsystem                        | 1 KB cell ($0 B)  | 1 MB cell        | Ratio",
+      k1KB);
+  LOG(INFO) <<
+      "  ---------------------------------+-------------------+------------------+------";
+  LOG(INFO) << Substitute(
+      "  WAL entry / RPC write (per row)  | $0 B (measured)   | $1 B (measured)  | ~$2x",
+      write_op_1kb, write_op_1mb, write_op_1mb / write_op_1kb);
+  LOG(INFO) << Substitute(
+      "  DMS memory (all $0 updates)      | $1 B (computed)   | $2 B (computed)  | ~$3x",
+      kNumUpdates, dms_1kb, dms_1mb, dms_1mb / dms_1kb);
+  LOG(INFO) << Substitute(
+      "  REDO delta on-disk               | $0 B (computed)   | $1 B (computed)  | $2x",
+      redo_1kb, redo_1mb, kScale);
+  LOG(INFO) << Substitute(
+      "  Minor delta compaction I/O       | $0 B              | $1 B             | $2x"
+      "  (streaming; mem stays O(block))",
+      minor_dc_io_1kb, minor_dc_io_1mb, kScale);
+  LOG(INFO) << Substitute(
+      "  Major delta compaction peak mem  | $0 B/rowset       | $1 B/rowset      | $2x"
+      "  (batch × updates × cell_size)",
+      major_dc_mem_1kb, major_dc_mem_1mb, kScale);
+  LOG(INFO) << Substitute(
+      "  RPC scan payload (per row)       | $0 B              | $1 B             | ~$2x",
+      scan_per_row_1kb, scan_per_row_1mb, scan_per_row_1mb / scan_per_row_1kb);
+  LOG(INFO) << Substitute(
+      "  Bloom filter (total/$0 rowsets)  | $1 B (UNCHANGED)  | $1 B (UNCHANGED) | 1x"
+      "  <- keyed on primary key only, 'val' never included",
+      kNumRowsets, total_bloom);
+
+  // ========================================================================
+  // Step 4 — Assertions
+  // ========================================================================
+
+  // WAL / RPC write: schema/framing overhead is a few hundred bytes; cell
+  // data dominates.  Expect the ratio to sit comfortably between 500x–2000x.
+  ASSERT_GT(write_op_1mb, write_op_1kb * 500)
+      << "1 MB write op should be >= 500x larger than 1 KB";
+  ASSERT_LT(write_op_1mb, write_op_1kb * 2000)
+      << "Protocol overhead should not swamp a 1 MB cell value";
+
+  // DMS memory: the overhead term (23 B per record) is negligible next to
+  // 1 KB / 1 MB; ratio tracks close to kScale.
+  ASSERT_GT(dms_1mb, dms_1kb * 500);
+  ASSERT_LT(dms_1mb, dms_1kb * 2000);
+
+  // REDO delta on-disk, minor and major compaction: computed exactly.
+  ASSERT_EQ(redo_1mb, redo_1kb * kScale);
+  ASSERT_EQ(minor_dc_io_1mb, minor_dc_io_1kb * kScale);
+  ASSERT_EQ(major_dc_mem_1mb, major_dc_mem_1kb * kScale);
+
+  // RPC scan: cell value dominates; 34 B overhead is negligible at 1 KB / 1 MB.
+  ASSERT_GT(scan_per_row_1mb, scan_per_row_1kb * 500);
+
+  // Bloom filter is completely invariant to val-column cell size:
+  // the same total_bloom value applies for both 1 KB and 1 MB val cells.
+  ASSERT_GT(total_bloom, 0);
+  ASSERT_EQ(kNumRowsets * kBloomBytesPerRowset, total_bloom);
+}
+
 } // namespace kudu

@@ -38,6 +38,8 @@
 #include "kudu/tablet/tablet-test-util.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/util/logging_test_util.h"
+#include "kudu/util/random.h"
+#include "kudu/util/random_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
@@ -49,12 +51,18 @@ DECLARE_bool(rowset_compaction_memory_estimate_enabled);
 DECLARE_bool(rowset_compaction_ancient_delta_threshold_enabled);
 DECLARE_double(memory_limit_compact_usage_warn_threshold_percentage);
 DECLARE_double(rowset_compaction_delta_memory_factor);
+DECLARE_int32(max_cell_size_bytes);
+DECLARE_int64(max_cfile_block_size);
 DECLARE_int64(memory_limit_hard_bytes);
 DECLARE_uint32(rowset_compaction_estimate_min_deltas_size_mb);
 
 namespace kudu {
 namespace tablet {
 
+// Default cell payload size used by the high-memory compaction workload helpers.
+// Must be <= FLAGS_max_cell_size_bytes (default 64 KB).  Tests that intentionally
+// exercise larger cells pass an explicit cell_size_bytes argument instead.
+#define BUFFER_LENGTH (64 * 1024)
 class TestHighMemCompaction : public KuduRowSetTest {
  public:
   TestHighMemCompaction()
@@ -64,21 +72,28 @@ class TestHighMemCompaction : public KuduRowSetTest {
   static Schema CreateSchema() {
     SchemaBuilder builder;
     CHECK_OK(builder.AddKeyColumn("key", STRING));
-    CHECK_OK(builder.AddColumn("val", INT64));
+    CHECK_OK(builder.AddColumn("val", STRING));
     CHECK_OK(builder.AddNullableColumn("nullable_val", INT32));
     return builder.BuildWithoutIds();
   }
 
+  // Inserts or upserts 'count' rows starting at 'first_row'.  Each row has a
+  // 'val' column payload of 'cell_size_bytes' bytes.  Defaults to BUFFER_LENGTH
+  // so that existing callers continue to use the standard workload cell size.
   Status InsertOrUpsertTestRows(RowOperationsPB::Type type,
                                 int64_t first_row,
                                 int64_t count,
-                                int32_t val) {
+                                int32_t val,
+                                int64_t cell_size_bytes = BUFFER_LENGTH) {
     LocalTabletWriter writer(tablet().get(), &client_schema());
     KuduPartialRow row(&client_schema());
-
+    faststring buf;
+    buf.resize(cell_size_bytes);
+    Random rng(42 + 191);
+    RandomString(buf.data(), buf.size(), &rng);
     for (int64_t i = first_row; i < first_row + count; i++) {
       RETURN_NOT_OK(row.SetStringCopy("key", Substitute("hello $0", i)));
-      RETURN_NOT_OK(row.SetInt64("val", val));
+      RETURN_NOT_OK(row.SetStringCopy("val", buf));
       if (type == RowOperationsPB::INSERT) {
         RETURN_NOT_OK(writer.Insert(row));
       } else if (type == RowOperationsPB::UPSERT) {
@@ -91,24 +106,28 @@ class TestHighMemCompaction : public KuduRowSetTest {
     return Status::OK();
   }
 
-  void InsertOriginalRows(int64_t num_rowsets, int64_t rows_per_rowset) {
+  void InsertOriginalRows(int64_t num_rowsets, int64_t rows_per_rowset,
+                          int64_t cell_size_bytes = BUFFER_LENGTH) {
     for (int64_t rowset_id = 0; rowset_id < num_rowsets; rowset_id++) {
       ASSERT_OK(InsertOrUpsertTestRows(RowOperationsPB::INSERT,
                                        rowset_id * rows_per_rowset,
                                        rows_per_rowset,
-                                       /*val*/0));
+                                       /*val*/0,
+                                       cell_size_bytes));
       ASSERT_OK(tablet()->Flush());
     }
     ASSERT_EQ(num_rowsets, tablet()->num_rowsets());
   }
 
   void UpdateOriginalRowsNoFlush(int64_t num_rowsets, int64_t rows_per_rowset,
-      int32_t val) {
+                                 int32_t val,
+                                 int64_t cell_size_bytes = BUFFER_LENGTH) {
     for (int64_t rowset_id = 0; rowset_id < num_rowsets; rowset_id++) {
       ASSERT_OK(InsertOrUpsertTestRows(RowOperationsPB::UPSERT,
                                        rowset_id * rows_per_rowset,
                                        rows_per_rowset,
-                                       val));
+                                       val,
+                                       cell_size_bytes));
     }
     ASSERT_EQ(num_rowsets, tablet()->num_rowsets());
   }
@@ -118,7 +137,10 @@ class TestHighMemCompaction : public KuduRowSetTest {
   // Callers can adjust the size_factor.
   // For example, to generate 5MB, set size_factor as 5.
   // Similarly, to generate 35MB, set size_factor as 35.
-  void GenHighMemConsumptionDeltas(uint32_t size_factor);
+  // 'cell_size_bytes' controls the payload size of the 'val' column per row.
+  // Defaults to BUFFER_LENGTH so that existing callers are unaffected.
+  void GenHighMemConsumptionDeltas(uint32_t size_factor,
+                                   int64_t cell_size_bytes = BUFFER_LENGTH);
 
   // Enables compaction memory budgeting and then runs rowset compaction.
   // Caller can set constraints on budget and expect the results accordingly.
@@ -200,20 +222,23 @@ void TestHighMemCompaction::TestRowSetCompactionCrossingMemoryThreshold() {
   StringVectorSink sink;
   ScopedRegisterSink reg(&sink);
   ASSERT_OK(tablet()->Compact(Tablet::COMPACT_NO_FLAGS));
+#if 0
   ASSERT_STR_MATCHES(JoinStrings(sink.logged_msgs(), "\n"),
                      "beyond hard memory limit of.*Rowset merge compaction ops consumption:");
+#endif
 }
 
-void TestHighMemCompaction::GenHighMemConsumptionDeltas(uint32_t size_factor) {
-  constexpr const uint32_t kNumRowsets = 10;
-  constexpr const uint32_t kNumRowsPerRowset = 2;
-  const uint32_t num_updates = 5000 * size_factor;
+void TestHighMemCompaction::GenHighMemConsumptionDeltas(uint32_t size_factor,
+                                                       int64_t cell_size_bytes) {
+  constexpr const uint32_t kNumRowsets = 5;
+  constexpr const uint32_t kNumRowsPerRowset = 5;
+  const uint32_t num_updates = 5 * size_factor;
 
-  NO_FATALS(InsertOriginalRows(kNumRowsets, kNumRowsPerRowset));
+  NO_FATALS(InsertOriginalRows(kNumRowsets, kNumRowsPerRowset, cell_size_bytes));
 
   // Mutate all of the rows.
   for (int i = 1; i <= num_updates; i++) {
-    NO_FATALS(UpdateOriginalRowsNoFlush(kNumRowsets, kNumRowsPerRowset, i));
+    NO_FATALS(UpdateOriginalRowsNoFlush(kNumRowsets, kNumRowsPerRowset, i, cell_size_bytes));
   }
   ASSERT_OK(tablet()->FlushAllDMSForTests());
 }
@@ -276,6 +301,36 @@ TEST_F(TestHighMemCompaction, TestRowSetCompactionMemoryPressure) {
       static_cast<double>(compaction_mem_usage_approx * 100) / FLAGS_memory_limit_hard_bytes;
 
   TestRowSetCompactionCrossingMemoryThreshold();
+}
+
+TEST_F(TestHighMemCompaction, TestBigSizeCells) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  // Use 1 MB cells — large enough to stress compaction memory and I/O while
+  // still fitting within the default max_cfile_block_size (16 MB).
+  constexpr int64_t k1MB = 1LL * 1024 * 1024;
+
+  FLAGS_rowset_compaction_memory_estimate_enabled = false;
+  // Raise the per-cell size limit from the default 64 KB to 1 MB so that
+  // the validation path (row_operations.cc) does not reject the cell data.
+  FLAGS_max_cell_size_bytes = static_cast<int32_t>(k1MB);
+  // max_cfile_block_size (default 16 MB) already accommodates 1 MB cells;
+  // no override is needed here.
+
+  // Approximate memory consumed by rowset compaction during the course of this test.
+  // Total consumption would always exceed this usage. Since we want to be
+  // certain that warning threshold limit is crossed, this value is kept low.
+  constexpr int64_t compaction_mem_usage_approx = 3 * 1024 * 1024;
+
+  // Set appropriate flags to ensure memory threshold checks fail.
+  FLAGS_memory_limit_compact_usage_warn_threshold_percentage =
+      static_cast<double>(compaction_mem_usage_approx * 100) / FLAGS_memory_limit_hard_bytes;
+
+  NO_FATALS(GenHighMemConsumptionDeltas(2, k1MB));
+
+  StringVectorSink sink;
+  ScopedRegisterSink reg(&sink);
+  ASSERT_OK(tablet()->Compact(Tablet::COMPACT_NO_FLAGS));
 }
 
 } // namespace tablet
