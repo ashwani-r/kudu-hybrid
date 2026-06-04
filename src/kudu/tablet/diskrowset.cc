@@ -925,7 +925,16 @@ Status DiskRowSet::IsDeletedAndFullyAncient(Timestamp ancient_history_mark,
 
 Status DiskRowSet::IsFullyMigrated(Timestamp migration_history_mark,
                                    bool* fully_migrated) {
-  *fully_migrated = delta_tracker_->EstimateAllRedosAreMigrated(migration_history_mark);
+  // UNDO stores are opened with OpenNoInit (delta_stats_ = nullptr) in
+  // DeltaTracker::DoOpen, so has_delta_stats() is initially false.
+  // EstimateAllRedosAndUndosAreMigrated conservatively returns false when
+  // stats are absent, which would permanently block migration GC for
+  // freshly-opened rowsets. Eagerly load all UNDO stores' stats from their
+  // file footers before the check (Init() does IO so it must run outside
+  // component_lock_).
+  RETURN_NOT_OK(delta_tracker_->EnsureNewestUndoInitialized(nullptr));
+  *fully_migrated =
+      delta_tracker_->EstimateAllRedosAndUndosAreMigrated(migration_history_mark);
   return Status::OK();
 }
 

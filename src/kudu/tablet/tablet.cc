@@ -1758,12 +1758,37 @@ Status Tablet::AlterSchema(AlterSchemaOpState* op_state) {
       metric_entity_->SetAttribute("table_name", op_state->new_table_name());
     }
   }
+  // Determine whether migration_timestamp is being set or updated to a new
+  // non-zero value. This covers both the first-time set (0 → T) and any
+  // subsequent update (T_old → T_new). Must be checked before SetExtraConfig()
+  // overwrites the old value.
+  const bool migration_ts_changed = [&]() -> bool {
+    if (!op_state->has_new_extra_config()) return false;
+    const auto& new_cfg = op_state->new_extra_config();
+    if (!new_cfg.has_migration_timestamp() || new_cfg.migration_timestamp() == 0) return false;
+    const auto& old_cfg = metadata_->extra_config();
+    const uint64_t old_ts = (old_cfg && old_cfg->has_migration_timestamp())
+                             ? old_cfg->migration_timestamp() : 0;
+    return new_cfg.migration_timestamp() != old_ts;
+  }();
+
   if (op_state->has_new_extra_config()) {
     metadata_->SetExtraConfig(op_state->new_extra_config());
   }
 
-  // If the current schema and the new one are equal, there is nothing to do.
+  // If the current schema and the new one are equal, there is normally nothing
+  // to do. However, if migration_timestamp changed to a new non-zero value,
+  // flush the active MemRowSet to disk so that migration GC can immediately
+  // operate on it. This applies both to the first-time set and to subsequent
+  // updates (e.g. a second migrate call with a newer timestamp). rowsets_flush_sem_
+  // is already held above, so FlushUnlocked() is safe to call here.
   if (same_schema) {
+    if (migration_ts_changed) {
+      LOG_WITH_PREFIX(INFO) << "migration_timestamp changed to "
+                            << op_state->new_extra_config().migration_timestamp()
+                            << "; flushing MemRowSet to enable migration GC";
+      return FlushUnlocked();
+    }
     return metadata_->Flush();
   }
 

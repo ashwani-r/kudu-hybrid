@@ -186,7 +186,24 @@ class DeltaTracker {
   // initted, this will return a false negative.
   bool EstimateAllRedosAreAncient(Timestamp ancient_history_mark);
 
-  bool EstimateAllRedosAreMigrated(Timestamp migration_history_mark);
+  // Returns whether every mutation timestamp in the rowset's delta stores
+  // (live DMS, all REDO files, and all UNDO files) is older than
+  // 'migration_history_mark'. This is an estimate: uninitialized delta stats
+  // or a DMS in the post-CreateAndInit/pre-Update race window conservatively
+  // yield false.
+  bool EstimateAllRedosAndUndosAreMigrated(Timestamp migration_history_mark);
+
+  // Ensures that all UNDO delta stores have their stats loaded from disk.
+  // UNDO stores are opened with OpenNoInit (delta_stats_ = nullptr) by
+  // DoOpen(), so has_delta_stats() returns false until Init() is called.
+  // EstimateAllRedosAndUndosAreMigrated() conservatively returns false when
+  // stats are absent; this method must be called before it to avoid false
+  // negatives for freshly-opened DiskRowSets.
+  //
+  // Init() involves a disk read so it must NOT be called while holding
+  // component_lock_. This method acquires only a brief shared lock to
+  // capture the store pointer, then releases it before performing I/O.
+  Status EnsureNewestUndoInitialized(const fs::IOContext* io_context);
 
   // See RowSet::InitUndoDeltas().
   Status InitUndoDeltas(Timestamp ancient_history_mark,

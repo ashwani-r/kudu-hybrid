@@ -505,38 +505,120 @@ bool DeltaTracker::EstimateAllRedosAreAncient(Timestamp ancient_history_mark) {
       newest_redo->delta_stats().max_timestamp() < ancient_history_mark;
 }
 
-bool DeltaTracker::EstimateAllRedosAreMigrated(Timestamp migration_history_mark) {
-  std::lock_guard lock(component_lock_);
-  const std::optional<Timestamp> dms_highest_timestamp =
-      dms_ ? dms_->highest_timestamp() : std::nullopt;
-  if (dms_highest_timestamp) {
-    return *dms_highest_timestamp < migration_history_mark;
-  }
+bool DeltaTracker::EstimateAllRedosAndUndosAreMigrated(Timestamp migration_history_mark) {
+  bool result = false;
+  std::string verdict_path;
 
-  // If we don't have a DMS or our DMS hasn't been written to at all, look at
-  // the newest redo store.
-  if (!redo_delta_stores_.empty()) {
-    const auto& newest_redo = redo_delta_stores_.back();
-    return newest_redo->has_delta_stats() &&
-        newest_redo->delta_stats().max_timestamp() < migration_history_mark;
-  }
 
-  // No redo deltas at all (e.g. a freshly compacted rowset with no subsequent
-  // updates). Unlike EstimateAllRedosAreAncient, which is only ever called on
-  // "deleted" rowsets that by definition have redo deltas, this function is
-  // called on any rowset. Fall back to the newest undo store (undos are kept
-  // in descending timestamp order, so front() is the newest). If the most
-  // recent insert predates the migration mark, the rowset's data is entirely
-  // old and it is eligible for purge.
-  if (!undo_delta_stores_.empty()) {
-    const auto& newest_undo = undo_delta_stores_.front();
-    return newest_undo->has_delta_stats() &&
-        newest_undo->delta_stats().max_timestamp() < migration_history_mark;
-  }
+  {
+    std::lock_guard lock(component_lock_);
 
-  // No evidence of rowset's latest timestamp older than migration time.
-  // i.e. purge needs to be skipped for this rowset.
-  return false;
+    const std::optional<Timestamp> dms_highest_timestamp =
+        dms_ ? dms_->highest_timestamp() : std::nullopt;
+
+    // Compute the verdict. Each exit point sets 'result' and 'verdict_path'
+    // then sets 'decided = true' so later checks are skipped.
+    bool decided = false;
+
+    if (dms_) {
+      // DMS exists. If highest_timestamp() returns nullopt it means the DMS was
+      // just created by CreateAndInitDMSUnlocked() but dms_->Update() has not yet
+      // been called — we are in the deliberate gap between the two critical
+      // sections inside DeltaTracker::Update(). A server-acknowledged write is
+      // in flight and must not be ignored. Report the rowset as NOT fully
+      // migrated so that migration GC cannot delete it while the write lands.
+      if (!dms_highest_timestamp) {
+        result = false;
+        verdict_path = "DMS-nullopt: write in flight";
+        decided = true;
+      } else if (*dms_highest_timestamp >= migration_history_mark) {
+        result = false;
+        verdict_path = "DMS-highest_ts";
+        decided = true;
+      }
+    }
+
+    // Every on-disk REDO store must have max_ts < migration_mark.
+    //
+    // Guard against the window inside DeltaTracker::Flush where the old
+    // DeltaMemStore is temporarily pushed into redo_delta_stores_ (so that
+    // in-flight readers can still access it) before the IO completes and the
+    // entry is replaced by a DeltaFileReader with real stats. During that
+    // window delta_stats().max_timestamp() == Timestamp::kMin.
+    if (!decided) {
+      for (const auto& redo : redo_delta_stores_) {
+        if (!redo->has_delta_stats()) {
+          result = false;
+          verdict_path = "REDO-no-stats: uninitialized";
+          decided = true;
+          break;
+        }
+        const Timestamp redo_max_ts = redo->delta_stats().max_timestamp();
+        if (redo_max_ts == Timestamp::kMin) {
+          result = false;
+          verdict_path = "REDO-kMin: DMS placeholder or uninit";
+          decided = true;
+          break;
+        }
+        if (redo_max_ts >= migration_history_mark) {
+          result = false;
+          verdict_path = "REDO-max_ts";
+          decided = true;
+          break;
+        }
+      }
+    }
+
+    // Every on-disk UNDO store must also have max_ts < migration_mark.
+    if (!decided) {
+      for (const auto& undo : undo_delta_stores_) {
+        if (!undo->has_delta_stats()) {
+          result = false;
+          verdict_path = "UNDO-no-stats: uninitialized";
+          decided = true;
+          break;
+        }
+        if (undo->delta_stats().max_timestamp() >= migration_history_mark) {
+          result = false;
+          verdict_path = "UNDO-max_ts";
+          decided = true;
+          break;
+        }
+      }
+    }
+
+    if (!decided) {
+      if (!dms_ && redo_delta_stores_.empty() && undo_delta_stores_.empty()) {
+        result = false; verdict_path = "no-stores";
+      } else {
+        result = true; verdict_path = "all-deltas-migrated";
+      }
+    }
+
+    VLOG(1) << LogPrefix()
+            << "  VERDICT: " << (result ? "MIGRATED" : "NOT migrated")
+            << " (via " << verdict_path << ")";
+
+  } // component_lock_ released here
+  return result;
+}
+
+Status DeltaTracker::EnsureNewestUndoInitialized(const IOContext* io_context) {
+  // Capture all UNDO stores under a brief shared lock. We retain shared_ptrs
+  // so the objects stay alive after the lock is dropped.
+
+  SharedDeltaStoreVector undos;
+  {
+    shared_lock lock(component_lock_);
+    undos = undo_delta_stores_;
+  }
+  // Init() reads the delta file footer from disk; call it outside the lock.
+  for (const auto& undo : undos) {
+    if (!undo->Initted()) {
+      RETURN_NOT_OK(undo->Init(io_context));
+    }
+  }
+  return Status::OK();
 }
 
 Status DeltaTracker::EstimateBytesInPotentiallyAncientUndoDeltas(
