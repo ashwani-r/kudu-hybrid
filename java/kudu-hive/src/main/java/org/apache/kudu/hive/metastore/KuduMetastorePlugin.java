@@ -603,8 +603,11 @@ public class KuduMetastorePlugin extends MetaStoreEventListener {
                     .saslProtocolName(getSaslProtocolName())
                     .build()
         );
-      } catch (IOException | InterruptedException e) {
-        throw new RuntimeException("Failed to create the Kudu client");
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException("Interrupted while creating the Kudu client", e);
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to create the Kudu client", e);
       }
       KUDU_CLIENTS.put(kuduMasters, client);
     }

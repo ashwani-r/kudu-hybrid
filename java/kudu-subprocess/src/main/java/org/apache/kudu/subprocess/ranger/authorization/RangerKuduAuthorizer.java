@@ -243,6 +243,6 @@ public class RangerKuduAuthorizer {
     Preconditions.checkArgument(!user.isEmpty());
     UserGroupInformation ugi;
     ugi = UserGroupInformation.createRemoteUser(user);
-    return new HashSet<>(ugi.getGroups());
+    return new HashSet<>(ugi.getGroupsSet());
   }
 }

@@ -43,6 +43,7 @@ if (KUDU_CLI_TEST_TOOL_ENABLED)
     mini_hms
     mini_kdc
     mini_oidc
+    mini_prometheus
     mini_ranger
     mini_ranger_kms
     server_base_proto
@@ -67,5 +68,5 @@ endif()
 # Unit tests
 #######################################
 
-SET_KUDU_TEST_LINK_LIBS(mini_cluster kudu_hms)
+SET_KUDU_TEST_LINK_LIBS(mini_cluster kudu_hms itest_util)
 ADD_KUDU_TEST(external_mini_cluster-test PROCESSORS 3)

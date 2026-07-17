@@ -342,7 +342,8 @@ METRIC_DEFINE_gauge_int64(server, uptime,
                           "Server Uptime",
                           kudu::MetricUnit::kMicroseconds,
                           "Time interval since the server has started",
-                          kudu::MetricLevel::kInfo);
+                          kudu::MetricLevel::kInfo,
+                          kudu::EXPOSE_AS_COUNTER);
 METRIC_DEFINE_gauge_int64(server, wal_dir_space_available_bytes,
                           "WAL Directory Space Free",
                           kudu::MetricUnit::kBytes,
@@ -698,7 +699,7 @@ constexpr const char* const kListenBacklogMax = "/proc/sys/net/core/somaxconn";
 constexpr const char* const kListenBacklogMax = "kern.ipc.somaxconn";
 #endif
 
-int32_t GetEffectiveListenSocketBacklog(Env* env, int backlog) {
+int32_t GetEffectiveListenSocketBacklog([[maybe_unused]] Env* env, int backlog) {
 #if defined(__APPLE__)
   uint32_t buf_val;
   size_t len = sizeof(buf_val);
@@ -971,7 +972,7 @@ Status ServerBase::Init() {
          .set_epki_private_password_key_cmd(FLAGS_rpc_private_key_password_cmd)
          .set_keytab_file(FLAGS_keytab_file)
          .set_hostname(hostname)
-         .set_acceptor_listen_backlog(listen_backlog)
+         .set_acceptor_listen_backlog(effective_listen_backlog)
          .enable_inbound_tls();
 
   auto username = kudu::security::GetLoggedInUsernameFromKeytab();
@@ -1363,7 +1364,9 @@ Status ServerBase::Start() {
     AddPostInitializedDefaultPathHandlers(web_server_.get());
     AddRpczPathHandlers(messenger_, web_server_.get());
     RegisterMetricsJsonHandler(web_server_.get(), metric_registry_.get());
-    RegisterMetricsPrometheusHandler(web_server_.get(), metric_registry_.get());
+    RegisterMetricsPrometheusHandler(web_server_.get(),
+                                     metric_registry_.get(),
+                                     messenger_->hostname());
     TracingPathHandlers::RegisterHandlers(web_server_.get());
     web_server_->set_footer_html(FooterHtml());
     web_server_->SetStartupComplete(true);

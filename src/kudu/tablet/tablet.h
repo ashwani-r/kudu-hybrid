@@ -39,7 +39,6 @@
 #include "kudu/fs/io_context.h"
 #include "kudu/gutil/integral_types.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/threading/thread_collision_warner.h"
 #include "kudu/tablet/lock_manager.h"
@@ -209,14 +208,14 @@ class Tablet {
   void StartApplying(ParticipantOpState* op_state);
 
   // Apply all of the row operations associated with this op.
-  Status ApplyRowOperations(WriteOpState* op_state) WARN_UNUSED_RESULT;
+  Status ApplyRowOperations(WriteOpState* op_state);
 
   // Apply a single row operation, which must already be prepared.
   // The result is set back into row_op->result.
   Status ApplyRowOperation(const fs::IOContext* io_context,
                            WriteOpState* op_state,
                            RowOp* row_op,
-                           ProbeStats* stats) WARN_UNUSED_RESULT;
+                           ProbeStats* stats);
 
   // Begins the transaction, recording its presence in the tablet metadata.
   // Upon calling this, 'op_id' will be anchored until the metadata is flushed,
@@ -453,7 +452,7 @@ class Tablet {
   // Calculates the ancient history mark and returns true iff tablet history GC
   // is enabled, which requires the use of a HybridClock.
   // Otherwise, returns false.
-  bool GetTabletAncientHistoryMark(Timestamp* ancient_history_mark) const WARN_UNUSED_RESULT;
+  [[nodiscard]] bool GetTabletAncientHistoryMark(Timestamp* ancient_history_mark) const;
 
   // Calculates the migration history mark and returns true iff tablet migration GC
   // is enabled, which requires the use of a HybridClock.
@@ -745,7 +744,7 @@ class Tablet {
   // row keys in the RowSets in the current RowSetTree (as determined by the op's
   // captured TabletComponents).
   Status BulkCheckPresence(const fs::IOContext* io_context,
-                           WriteOpState* op_state) WARN_UNUSED_RESULT;
+                           WriteOpState* op_state);
 
   // Capture a set of iterators which, together, reflect all of the data in the tablet.
   //
@@ -783,6 +782,12 @@ class Tablet {
                        const RowSetMetadataVector& to_add,
                        int64_t mrs_being_flushed,
                        const std::vector<TxnInfoBeingFlushed>& txns_being_flushed);
+
+  // Updates tablet metrics with the orphaned block info from metadata flush outcome.
+  void UpdateOrphanBlockMetrics(const TabletMetadata::OrphanBlockCleanupStats& orphan_stats);
+
+  // Flushes tablet metadata and updates metrics.
+  Status FlushTabletMetadataAndUpdateMetrics();
 
   // Computes on-disk size of all the deltas in provided rowsets.
   size_t GetAllDeltasSizeOnDisk(const RowSetsInCompactionOrFlush& input);

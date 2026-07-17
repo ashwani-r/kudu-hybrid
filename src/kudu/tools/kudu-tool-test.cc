@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <signal.h>
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -41,7 +42,7 @@
 #include <utility>
 #include <vector>
 
-#include <gflags/gflags_declare.h>
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <glog/stl_logging.h>
 #include <gmock/gmock.h>
@@ -107,8 +108,9 @@
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/mini-cluster/mini_cluster.h"
+#include "kudu/rpc/messenger.h"  // IWYU pragma: keep
 #include "kudu/rpc/rpc_controller.h"
-#include "kudu/rpc/transfer.h"
+#include "kudu/security/test/mini_kdc.h"
 #include "kudu/subprocess/subprocess_protocol.h"
 #include "kudu/tablet/local_tablet_writer.h"
 #include "kudu/tablet/metadata.pb.h"
@@ -119,6 +121,7 @@
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/thrift/client.h"
 #include "kudu/tools/tool.pb.h"
+#include "kudu/tools/tool_action_common.h"
 #include "kudu/tools/tool_replica_util.h"
 #include "kudu/tools/tool_test_util.h"
 #include "kudu/tserver/mini_tablet_server.h"
@@ -168,6 +171,7 @@ DECLARE_int32(heartbeat_interval_ms);
 DECLARE_int32(tablet_copy_transfer_chunk_size_bytes);
 DECLARE_int32(tserver_unresponsive_timeout_ms);
 DECLARE_int32(rpc_negotiation_inject_delay_ms);
+DECLARE_int64(rpc_max_message_size);
 DECLARE_string(block_manager);
 DECLARE_string(hive_metastore_uris);
 
@@ -3764,6 +3768,155 @@ TEST_F(ToolTest, TestLoadgenDefaultParameters) {
   NO_FATALS(RunLoadgen());
 }
 
+namespace {
+// Locate the single auto-created loadgen table on the cluster (created when
+// 'kudu perf loadgen' is invoked without --table_name) and verify that its
+// schema matches the expected (column name, type) sequence in order.
+//
+// The row-count check produced by --run_scan is not sufficient on its own:
+// GenerateRowData() iterates whatever columns the schema has, so a regression
+// where extra columns are silently dropped or mis-typed would still leave the
+// expected/actual row counts equal. Inspecting the schema closes that gap.
+void VerifyLoadgenAutoTableSchema(
+    KuduClient* client,
+    const vector<pair<string, client::KuduColumnSchema::DataType>>& expected_cols) {
+  vector<string> tables;
+  ASSERT_OK(client->ListTables(&tables));
+  string auto_table_name;
+  for (const auto& t : tables) {
+    if (t.find("loadgen_auto_") != string::npos) {
+      ASSERT_TRUE(auto_table_name.empty())
+          << "found multiple auto-created tables: " << auto_table_name
+          << ", " << t;
+      auto_table_name = t;
+    }
+  }
+  ASSERT_FALSE(auto_table_name.empty()) << "no loadgen_auto_* table found";
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client->OpenTable(auto_table_name, &table));
+  const KuduSchema& schema = table->schema();
+  ASSERT_EQ(expected_cols.size(), schema.num_columns());
+  for (size_t i = 0; i < expected_cols.size(); ++i) {
+    ASSERT_EQ(expected_cols[i].first, schema.Column(i).name())
+        << "column index " << i;
+    ASSERT_EQ(expected_cols[i].second, schema.Column(i).type())
+        << "column index " << i;
+  }
+}
+} // anonymous namespace
+
+// Run loadgen against an auto-created table whose width is controlled by
+// --table_num_int_columns and --table_num_string_columns. The test verifies
+// both the on-cluster schema (column count, names, and types) and that the
+// post-insertion scan reads back the expected number of rows -- together this
+// confirms that every requested column was created and written.
+TEST_F(ToolTest, TestLoadgenAutoTableNumColumns) {
+  static constexpr int kNumIntCols = 5;
+  static constexpr int kNumStringCols = 3;
+  string out;
+  NO_FATALS(RunLoadgen(
+      /*num_tservers=*/1,
+      {
+        Substitute("--table_num_int_columns=$0", kNumIntCols),
+        Substitute("--table_num_string_columns=$0", kNumStringCols),
+        "--num_threads=2",
+        "--num_rows_per_thread=200",
+        "--keep_auto_table",
+        "--run_scan",
+      },
+      /*table_name=*/"",
+      &out));
+  ASSERT_STR_MATCHES(out, "expected rows: 400");
+  ASSERT_STR_MATCHES(out, "actual rows  : 400");
+
+  vector<pair<string, client::KuduColumnSchema::DataType>> expected;
+  expected.emplace_back("key", client::KuduColumnSchema::INT64);
+  for (int i = 0; i < kNumIntCols; ++i) {
+    expected.emplace_back(Substitute("int_val_$0", i + 1),
+                          client::KuduColumnSchema::INT32);
+  }
+  for (int i = 0; i < kNumStringCols; ++i) {
+    expected.emplace_back(Substitute("string_val_$0", i + 1),
+                          client::KuduColumnSchema::STRING);
+  }
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+  NO_FATALS(VerifyLoadgenAutoTableSchema(client.get(), expected));
+}
+
+// Edge case: --table_num_int_columns=0 and --table_num_string_columns=0 yield
+// an auto-created table consisting of just the INT64 primary key column.
+TEST_F(ToolTest, TestLoadgenAutoTablePkOnly) {
+  string out;
+  NO_FATALS(RunLoadgen(
+      /*num_tservers=*/1,
+      {
+        "--table_num_int_columns=0",
+        "--table_num_string_columns=0",
+        "--num_threads=1",
+        "--num_rows_per_thread=100",
+        "--keep_auto_table",
+        "--run_scan",
+      },
+      /*table_name=*/"",
+      &out));
+  ASSERT_STR_MATCHES(out, "expected rows: 100");
+  ASSERT_STR_MATCHES(out, "actual rows  : 100");
+
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+  NO_FATALS(VerifyLoadgenAutoTableSchema(
+      client.get(),
+      {{"key", client::KuduColumnSchema::INT64}}));
+}
+
+// Backward-compatibility regression test: with both column-count flags left at
+// their defaults (1 + 1), the auto-created schema must remain byte-for-byte
+// identical to the legacy three-column layout ('key', 'int_val', 'string_val')
+// so existing users and downstream tooling are unaffected.
+TEST_F(ToolTest, TestLoadgenAutoTableLegacySchemaPreserved) {
+  string out;
+  NO_FATALS(RunLoadgen(
+      /*num_tservers=*/1,
+      {
+        "--num_threads=1",
+        "--num_rows_per_thread=10",
+        "--keep_auto_table",
+        "--run_scan",
+      },
+      /*table_name=*/"",
+      &out));
+  ASSERT_STR_MATCHES(out, "actual rows  : 10");
+
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+  NO_FATALS(VerifyLoadgenAutoTableSchema(
+      client.get(),
+      {
+        {"key", client::KuduColumnSchema::INT64},
+        {"int_val", client::KuduColumnSchema::INT32},
+        {"string_val", client::KuduColumnSchema::STRING},
+      }));
+}
+
+// Negative values for the column-count flags must be rejected at startup by
+// the GROUP_FLAG_VALIDATOR.
+TEST_F(ToolTest, TestLoadgenAutoTableNumColumnsNegativeRejected) {
+  ExternalMiniClusterOptions opts;
+  NO_FATALS(StartExternalMiniCluster(std::move(opts)));
+  const vector<string> args = {
+    "perf",
+    "loadgen",
+    cluster_->master()->bound_rpc_addr().ToString(),
+    "--table_num_int_columns=-1",
+    "--num_rows_per_thread=1",
+  };
+  string err;
+  Status s = RunKuduTool(args, nullptr, &err);
+  ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
+  ASSERT_STR_CONTAINS(err, "--table_num_int_columns must be >= 0");
+}
+
 // Verify it's possible to run loadgen to create a table, no records inserted.
 // Also verify that --num_rows_per_thread=0 in case of existing table
 // results in no rows inserted.
@@ -6802,6 +6955,88 @@ TEST_F(ToolTest, TestAddColumn) {
   ASSERT_EQ(table->schema().Column(2), expected_schema.Column(1));
 }
 
+// Regression test for the `kudu table add_column` CLI not forwarding
+// type attributes (precision/scale/length) to KuduColumnSpec, which used
+// to make it impossible to add DECIMAL or VARCHAR columns via the tool.
+TEST_F(ToolTest, TestAddDecimalAndVarcharColumn) {
+  NO_FATALS(StartExternalMiniCluster());
+  const string kTableName = "kudu.table.add.column.types";
+  const string kDecimalCol = "dec_col";
+  const string kVarcharCol = "vc_col";
+
+  KuduSchemaBuilder schema_builder;
+  schema_builder.AddColumn("key")
+      ->Type(client::KuduColumnSchema::INT32)
+      ->NotNull()
+      ->PrimaryKey();
+  KuduSchema schema;
+  ASSERT_OK(schema_builder.Build(&schema));
+
+  TestWorkload workload(cluster_.get());
+  workload.set_table_name(kTableName);
+  workload.set_schema(schema);
+  workload.set_num_replicas(1);
+  workload.Setup();
+
+  const string master_addr = cluster_->master()->bound_rpc_addr().ToString();
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(KuduClientBuilder()
+            .add_master_server_addr(master_addr)
+            .Build(&client));
+
+  // 1) Successful DECIMAL add with precision and scale.
+  NO_FATALS(RunActionStdoutNone(Substitute(
+      "table add_column $0 $1 $2 DECIMAL "
+      "-column_precision=10 -column_scale=2",
+      master_addr, kTableName, kDecimalCol)));
+
+  // 2) Successful VARCHAR add with length.
+  NO_FATALS(RunActionStdoutNone(Substitute(
+      "table add_column $0 $1 $2 VARCHAR -column_length=64",
+      master_addr, kTableName, kVarcharCol)));
+
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client->OpenTable(kTableName, &table));
+  const auto& s = table->schema();
+
+  // Verify DECIMAL column attributes.
+  int dec_idx = -1;
+  int vc_idx = -1;
+  for (size_t i = 0; i < s.num_columns(); ++i) {
+    if (s.Column(i).name() == kDecimalCol) dec_idx = static_cast<int>(i);
+    if (s.Column(i).name() == kVarcharCol) vc_idx = static_cast<int>(i);
+  }
+  ASSERT_NE(-1, dec_idx);
+  ASSERT_NE(-1, vc_idx);
+  ASSERT_EQ(client::KuduColumnSchema::DECIMAL, s.Column(dec_idx).type());
+  ASSERT_EQ(10, s.Column(dec_idx).type_attributes().precision());
+  ASSERT_EQ(2, s.Column(dec_idx).type_attributes().scale());
+  ASSERT_EQ(client::KuduColumnSchema::VARCHAR, s.Column(vc_idx).type());
+  ASSERT_EQ(64, s.Column(vc_idx).type_attributes().length());
+
+  // 3) Missing --column_precision for DECIMAL must be rejected client-side.
+  {
+    string stderr;
+    Status st = RunActionStderrString(
+        Substitute("table add_column $0 $1 dec_missing DECIMAL",
+                   master_addr, kTableName),
+        &stderr);
+    ASSERT_FALSE(st.ok());
+    ASSERT_STR_CONTAINS(stderr, "must specify --column_precision");
+  }
+
+  // 4) Missing --column_length for VARCHAR must be rejected client-side.
+  {
+    string stderr;
+    Status st = RunActionStderrString(
+        Substitute("table add_column $0 $1 vc_missing VARCHAR",
+                   master_addr, kTableName),
+        &stderr);
+    ASSERT_FALSE(st.ok());
+    ASSERT_STR_CONTAINS(stderr, "must specify --column_length");
+  }
+}
+
 TEST_F(ToolTest, TestDeleteColumn) {
   NO_FATALS(StartExternalMiniCluster());
   constexpr const char* const kTableName = "kudu.table.delete.column";
@@ -7160,14 +7395,15 @@ TEST_P(ToolTestKerberosParameterized, TestHmsDowngrade) {
   thrift::ClientOptions hms_opts;
   hms_opts.enable_kerberos = EnableKerberos();
   hms_opts.service_principal = "hive";
-  HmsClient hms_client(cluster_->hms()->address(), hms_opts);
-  ASSERT_OK(hms_client.Start());
-  ASSERT_TRUE(hms_client.IsConnected());
+  unique_ptr<HmsClient> hms_client;
+  ASSERT_OK(HmsClient::New(cluster_->hms()->address(), hms_opts, &hms_client));
+  ASSERT_OK(hms_client->Start());
+  ASSERT_TRUE(hms_client->IsConnected());
   shared_ptr<KuduClient> kudu_client;
   ASSERT_OK(cluster_->CreateClient(nullptr, &kudu_client));
 
   ASSERT_OK(CreateKuduTable(kudu_client, "default.a"));
-  NO_FATALS(ValidateHmsEntries(&hms_client, kudu_client, "default", "a", master_addr));
+  NO_FATALS(ValidateHmsEntries(hms_client.get(), kudu_client, "default", "a", master_addr));
 
   // Downgrade to legacy table in both Hive Metastore and Kudu.
   // --hive_metastore_uris and --hive_metastore_sasl_enabled are automatically
@@ -7186,7 +7422,7 @@ TEST_P(ToolTestKerberosParameterized, TestHmsDowngrade) {
   shared_ptr<KuduTable> kudu_table;
   ASSERT_OK(kudu_client->OpenTable("default.a", &kudu_table));
   hive::Table hms_table;
-  ASSERT_OK(hms_client.GetTable("default", "a", &hms_table));
+  ASSERT_OK(hms_client->GetTable("default", "a", &hms_table));
 
   // Check that re-upgrading works as expected.
   NO_FATALS(RunActionStdoutNone(Substitute("hms fix $0", master_addr)));
@@ -7232,9 +7468,10 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
   hms_opts.enable_kerberos = EnableKerberos();
   hms_opts.service_principal = "hive";
   hms_opts.verify_service_config = false;
-  HmsClient hms_client(cluster_->hms()->address(), hms_opts);
-  ASSERT_OK(hms_client.Start());
-  ASSERT_TRUE(hms_client.IsConnected());
+  unique_ptr<HmsClient> hms_client;
+  ASSERT_OK(HmsClient::New(cluster_->hms()->address(), hms_opts, &hms_client));
+  ASSERT_OK(hms_client->Start());
+  ASSERT_TRUE(hms_client->IsConnected());
 
   FLAGS_hive_metastore_uris = cluster_->hms()->uris();
   FLAGS_hive_metastore_sasl_enabled = EnableKerberos();
@@ -7268,11 +7505,11 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
       kUsername, KuduSchema::ToSchema(control_external->schema()), control_external->comment(),
       HmsClient::kExternalTable));
   hive::Table hms_control_external;
-  ASSERT_OK(hms_client.GetTable("default", "control_external", &hms_control_external));
+  ASSERT_OK(hms_client->GetTable("default", "control_external", &hms_control_external));
   hms_control_external.parameters[HmsClient::kKuduTableIdKey] = control_external->id();
   hms_control_external.parameters[HmsClient::kKuduClusterIdKey] = kudu_client->cluster_id();
   hms_control_external.parameters[HmsClient::kExternalPurgeKey] = "true";
-  ASSERT_OK(hms_client.AlterTable("default", "control_external",
+  ASSERT_OK(hms_client->AlterTable("default", "control_external",
       hms_control_external, master_ctx));
 
   // Test case: Upper-case names are handled specially in a few places.
@@ -7348,7 +7585,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
   }
   std::reverse(modified_addrs.begin(), modified_addrs.end());
   LOG(INFO) << "Modified Masters: " << JoinStrings(modified_addrs, ",");
-  ASSERT_OK(AlterHmsWithReplacedParam(&hms_client, "default", "orphan_hms_table_masters",
+  ASSERT_OK(AlterHmsWithReplacedParam(hms_client.get(), "default", "orphan_hms_table_masters",
       HmsClient::kKuduMasterAddrsKey, JoinStrings(modified_addrs, ",")));
 
   // Test case: orphan external synchronized table in the HMS.
@@ -7357,13 +7594,13 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
       "orphan-hms-cluster-id-external", kUsername,
       SchemaBuilder().Build(), "", HmsClient::kExternalTable));
   hive::Table hms_orphan_external;
-  ASSERT_OK(hms_client.GetTable("default", "orphan_hms_table_external", &hms_orphan_external));
+  ASSERT_OK(hms_client->GetTable("default", "orphan_hms_table_external", &hms_orphan_external));
   hms_orphan_external.parameters[HmsClient::kExternalPurgeKey] = "true";
-  ASSERT_OK(hms_client.AlterTable("default", "orphan_hms_table_external",
+  ASSERT_OK(hms_client->AlterTable("default", "orphan_hms_table_external",
       hms_orphan_external, master_ctx));
 
   // Test case: orphan legacy table in the HMS.
-  ASSERT_OK(CreateLegacyHmsTable(&hms_client, "default", "orphan_hms_table_legacy_managed",
+  ASSERT_OK(CreateLegacyHmsTable(hms_client.get(), "default", "orphan_hms_table_legacy_managed",
         "impala::default.orphan_hms_table_legacy_managed",
         master_addrs_str, HmsClient::kManagedTable, kUsername));
 
@@ -7374,23 +7611,23 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
   shared_ptr<KuduTable> legacy_managed;
   ASSERT_OK(CreateKuduTable(kudu_client, "impala::default.legacy_managed", kUsername));
   ASSERT_OK(kudu_client->OpenTable("impala::default.legacy_managed", &legacy_managed));
-  ASSERT_OK(CreateLegacyHmsTable(&hms_client, "default", "legacy_managed",
+  ASSERT_OK(CreateLegacyHmsTable(hms_client.get(), "default", "legacy_managed",
       "impala::default.legacy_managed", master_addrs_str, HmsClient::kManagedTable, kUsername));
 
   // Test case: Legacy external purge table.
   shared_ptr<KuduTable> legacy_purge;
   ASSERT_OK(CreateKuduTable(kudu_client, "impala::default.legacy_purge", kUsername));
   ASSERT_OK(kudu_client->OpenTable("impala::default.legacy_purge", &legacy_purge));
-  ASSERT_OK(CreateLegacyHmsTable(&hms_client, "default", "legacy_purge",
+  ASSERT_OK(CreateLegacyHmsTable(hms_client.get(), "default", "legacy_purge",
       "impala::default.legacy_purge", master_addrs_str, HmsClient::kExternalTable, kUsername));
   hive::Table hms_legacy_purge;
-  ASSERT_OK(hms_client.GetTable("default", "legacy_purge", &hms_legacy_purge));
+  ASSERT_OK(hms_client->GetTable("default", "legacy_purge", &hms_legacy_purge));
   hms_legacy_purge.parameters[HmsClient::kExternalPurgeKey] = "true";
-  ASSERT_OK(hms_client.AlterTable("default", "legacy_purge",
+  ASSERT_OK(hms_client->AlterTable("default", "legacy_purge",
                                   hms_legacy_purge, master_ctx));
 
   // Test case: legacy external table (pointed at the legacy managed table).
-  ASSERT_OK(CreateLegacyHmsTable(&hms_client, "default", "legacy_external",
+  ASSERT_OK(CreateLegacyHmsTable(hms_client.get(), "default", "legacy_external",
       "impala::default.legacy_managed", master_addrs_str, HmsClient::kExternalTable, kUsername));
 
   // Test case: legacy managed table with no owner.
@@ -7398,7 +7635,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
   ASSERT_OK(CreateKuduTable(kudu_client, "impala::default.legacy_no_owner",
                             static_cast<string>("")));
   ASSERT_OK(kudu_client->OpenTable("impala::default.legacy_no_owner", &legacy_no_owner));
-  ASSERT_OK(CreateLegacyHmsTable(&hms_client, "default", "legacy_no_owner",
+  ASSERT_OK(CreateLegacyHmsTable(hms_client.get(), "default", "legacy_no_owner",
         "impala::default.legacy_no_owner", master_addrs_str, HmsClient::kManagedTable,
         nullopt));
 
@@ -7407,14 +7644,14 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
   ASSERT_OK(CreateKuduTable(kudu_client, "legacy_hive_incompatible_name", kUsername));
   ASSERT_OK(kudu_client->OpenTable("legacy_hive_incompatible_name",
         &legacy_hive_incompatible_name));
-  ASSERT_OK(CreateLegacyHmsTable(&hms_client, "default", "legacy_hive_incompatible_name",
+  ASSERT_OK(CreateLegacyHmsTable(hms_client.get(), "default", "legacy_hive_incompatible_name",
         "legacy_hive_incompatible_name", master_addrs_str,
         HmsClient::kManagedTable, kUsername));
 
   // Test case: Kudu table in non-default database.
   hive::Database db;
   db.name = "my_db";
-  ASSERT_OK(hms_client.CreateDatabase(db));
+  ASSERT_OK(hms_client->CreateDatabase(db));
   ASSERT_OK(CreateKuduTable(kudu_client, "my_db.table", kUsername));
 
   // Test case: no owner in HMS
@@ -7591,11 +7828,11 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
     "legacy_external",
     "legacy_hive_incompatible_name",
   }) {
-    NO_FATALS(ValidateHmsEntries(&hms_client, kudu_client, "default", table, master_addrs_str));
+    NO_FATALS(ValidateHmsEntries(hms_client.get(), kudu_client, "default", table, master_addrs_str));
   }
 
   // Validate the tables in the other databases.
-  NO_FATALS(ValidateHmsEntries(&hms_client, kudu_client, "my_db", "table", master_addrs_str));
+  NO_FATALS(ValidateHmsEntries(hms_client.get(), kudu_client, "my_db", "table", master_addrs_str));
 
   vector<string> kudu_tables;
   ASSERT_OK(kudu_client->ListTables(&kudu_tables));
@@ -7631,7 +7868,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
         make_pair("different_owner", kUsername),
   })) {
     hive::Table table;
-    ASSERT_OK(hms_client.GetTable("default", p.first, &table));
+    ASSERT_OK(hms_client->GetTable("default", p.first, &table));
     ASSERT_EQ(p.second, table.owner);
   }
 }
@@ -7652,9 +7889,11 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndManualFixHmsMetadata) {
   hms_opts.enable_kerberos = EnableKerberos();
   hms_opts.service_principal = "hive";
   hms_opts.verify_service_config = false;
-  HmsClient hms_client(cluster_->hms()->address(), hms_opts);
-  ASSERT_OK(hms_client.Start());
-  ASSERT_TRUE(hms_client.IsConnected());
+
+  unique_ptr<HmsClient> hms_client;
+  ASSERT_OK(HmsClient::New(cluster_->hms()->address(), hms_opts, &hms_client));
+  ASSERT_OK(hms_client->Start());
+  ASSERT_TRUE(hms_client->IsConnected());
 
   FLAGS_hive_metastore_uris = cluster_->hms()->uris();
   FLAGS_hive_metastore_sasl_enabled = EnableKerberos();
@@ -7688,7 +7927,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndManualFixHmsMetadata) {
   ASSERT_OK(CreateKuduTable(kudu_client, "non_existent_database.table"));
 
   // Test case: a legacy table with a Hive name which conflicts with another table in Kudu.
-  ASSERT_OK(CreateLegacyHmsTable(&hms_client, "default", "conflicting_legacy_table",
+  ASSERT_OK(CreateLegacyHmsTable(hms_client.get(), "default", "conflicting_legacy_table",
         "impala::default.conflicting_legacy_table",
         master_addr, HmsClient::kManagedTable, kUsername));
   ASSERT_OK(CreateKuduTable(kudu_client, "impala::default.conflicting_legacy_table"));
@@ -7746,7 +7985,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndManualFixHmsMetadata) {
   // Create the missing database.
   hive::Database db;
   db.name = "non_existent_database";
-  ASSERT_OK(hms_client.CreateDatabase(db));
+  ASSERT_OK(hms_client->CreateDatabase(db));
 
   // Rename the conflicting table.
   NO_FATALS(RunActionStdoutNone(Substitute(
@@ -7781,8 +8020,9 @@ TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
   NO_FATALS(StartExternalMiniCluster(std::move(opts)));
 
   thrift::ClientOptions hms_opts;
-  HmsClient hms_client(cluster_->hms()->address(), hms_opts);
-  ASSERT_OK(hms_client.Start());
+  unique_ptr<HmsClient> hms_client;
+  ASSERT_OK(HmsClient::New(cluster_->hms()->address(), hms_opts, &hms_client));
+  ASSERT_OK(hms_client->Start());
 
   shared_ptr<KuduClient> kudu_client;
   ASSERT_OK(cluster_->CreateClient(nullptr, &kudu_client));
@@ -7803,7 +8043,7 @@ TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
   {
     std::reverse(master_addrs.begin(), master_addrs.end());
     hive::Table hms_table_reversed_masters;
-    ASSERT_OK(AlterHmsWithReplacedParam(&hms_client, "default", "table",
+    ASSERT_OK(AlterHmsWithReplacedParam(hms_client.get(), "default", "table",
         HmsClient::kKuduMasterAddrsKey, JoinStrings(master_addrs, ",")));
     NO_FATALS(RunActionStdoutNone(Substitute("hms check $0", master_addrs_str)));
   }
@@ -7814,7 +8054,7 @@ TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
   // aren't quite right that overlap with the correct set of masters (e.g. in
   // the case of a multi-master migration).
   // Try with an extra master.
-  ASSERT_OK(AlterHmsWithReplacedParam(&hms_client, "default", "table",
+  ASSERT_OK(AlterHmsWithReplacedParam(hms_client.get(), "default", "table",
       HmsClient::kKuduMasterAddrsKey, Substitute("$0,other_master_addr", master_addrs_str)));
   Status s = RunActionStdoutStderrString(
       Substitute("hms check $0", master_addrs_str), &out, &err);
@@ -7823,7 +8063,7 @@ TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
   NO_FATALS(RunActionStdoutNone(Substitute("hms check $0", master_addrs_str)));
 
   // And with a missing master.
-  ASSERT_OK(AlterHmsWithReplacedParam(&hms_client, "default", "table",
+  ASSERT_OK(AlterHmsWithReplacedParam(hms_client.get(), "default", "table",
       HmsClient::kKuduMasterAddrsKey, cluster_->master_rpc_addrs()[0].ToString()));
   s = RunActionStdoutStderrString(Substitute("hms check $0", master_addrs_str), &out, &err);
   ASSERT_STR_CONTAINS(out, "default.table");
@@ -7831,7 +8071,7 @@ TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
   NO_FATALS(RunActionStdoutNone(Substitute("hms check $0", master_addrs_str)));
 
   // Set the masters to point to an entirely different set of masters.
-  ASSERT_OK(AlterHmsWithReplacedParam(&hms_client, "default", "table",
+  ASSERT_OK(AlterHmsWithReplacedParam(hms_client.get(), "default", "table",
       HmsClient::kKuduMasterAddrsKey, "other_master_addrs"));
 
   // The check tool will ignore the HMS metadata from the other cluster, and
@@ -7961,9 +8201,11 @@ TEST_F(ToolTest, TestHmsList) {
   thrift::ClientOptions hms_opts;
   hms_opts.enable_kerberos = EnableKerberos();
   hms_opts.service_principal = "hive";
-  HmsClient hms_client(cluster_->hms()->address(), hms_opts);
-  ASSERT_OK(hms_client.Start());
-  ASSERT_TRUE(hms_client.IsConnected());
+
+  unique_ptr<HmsClient> hms_client;
+  ASSERT_OK(HmsClient::New(cluster_->hms()->address(), hms_opts, &hms_client));
+  ASSERT_OK(hms_client->Start());
+  ASSERT_TRUE(hms_client->IsConnected());
 
   FLAGS_hive_metastore_uris = cluster_->hms()->uris();
   FLAGS_hive_metastore_sasl_enabled = EnableKerberos();
@@ -8035,9 +8277,11 @@ TEST_F(ToolTest, TestHMSAddressLog) {
   thrift::ClientOptions hms_opts;
   hms_opts.enable_kerberos = EnableKerberos();
   hms_opts.service_principal = "hive";
-  HmsClient hms_client(cluster_->hms()->address(), hms_opts);
-  ASSERT_OK(hms_client.Start());
-  ASSERT_TRUE(hms_client.IsConnected());
+
+  unique_ptr<hms::HmsClient> hms_client;
+  ASSERT_OK(hms::HmsClient::New(cluster_->hms()->address(), hms_opts, &hms_client));
+  ASSERT_OK(hms_client->Start());
+  ASSERT_TRUE(hms_client->IsConnected());
 
   FLAGS_hive_metastore_uris = cluster_->hms()->uris();
   FLAGS_hive_metastore_sasl_enabled = EnableKerberos();
@@ -8610,6 +8854,96 @@ TEST_P(ControlShellToolTest, TestControlShell) {
     req.mutable_destroy_cluster();
     ASSERT_OK(SendReceive(req, &resp));
   }
+}
+
+// Verify that setting leave_files=true in CreateClusterRequestPB causes the
+// cluster root to be preserved when the control shell exits.
+TEST_P(ControlShellToolTest, TestLeaveFiles) {
+  const string cluster_root = JoinPathSegments(test_dir_, "leave-files-cluster");
+  ASSERT_OK(env_->CreateDir(cluster_root));
+
+  {
+    ControlShellRequestPB req;
+    ControlShellResponsePB resp;
+    req.mutable_create_cluster()->set_cluster_root(cluster_root);
+    req.mutable_create_cluster()->set_num_tservers(1);
+    req.mutable_create_cluster()->set_leave_files(true);
+    ASSERT_OK(SendReceive(req, &resp));
+  }
+
+  // Close the protocol (EOF on stdin triggers shell exit).
+  proto_.reset();
+  ASSERT_OK(shell_->Wait());
+  int exit_status;
+  ASSERT_OK(shell_->GetExitStatus(&exit_status));
+  ASSERT_EQ(0, exit_status);
+
+  // The cluster root should still exist.
+  ASSERT_TRUE(env_->FileExists(cluster_root));
+  ASSERT_OK(env_->DeleteRecursively(cluster_root));
+}
+
+// Verify that without leave_files (the default), the cluster root is deleted
+// when the control shell exits.
+TEST_P(ControlShellToolTest, TestDeleteOnExit) {
+  const string cluster_root = JoinPathSegments(test_dir_, "delete-on-exit-cluster");
+  ASSERT_OK(env_->CreateDir(cluster_root));
+
+  {
+    ControlShellRequestPB req;
+    ControlShellResponsePB resp;
+    req.mutable_create_cluster()->set_cluster_root(cluster_root);
+    req.mutable_create_cluster()->set_num_tservers(1);
+    // leave_files defaults to false; cluster root should be cleaned up on exit.
+    ASSERT_OK(SendReceive(req, &resp));
+  }
+
+  // Close the protocol (EOF on stdin triggers shell exit).
+  proto_.reset();
+  ASSERT_OK(shell_->Wait());
+  int exit_status;
+  ASSERT_OK(shell_->GetExitStatus(&exit_status));
+  ASSERT_EQ(0, exit_status);
+
+  // The cluster root should have been deleted.
+  ASSERT_FALSE(env_->FileExists(cluster_root));
+}
+
+// Verify that when the control shell exits abnormally (non-zero exit status),
+// the cluster root is preserved regardless of the leave_files setting.
+TEST_P(ControlShellToolTest, TestPreserveFilesOnAbnormalExit) {
+  const string cluster_root = JoinPathSegments(test_dir_, "abnormal-exit-cluster");
+  ASSERT_OK(env_->CreateDir(cluster_root));
+
+  {
+    ControlShellRequestPB req;
+    ControlShellResponsePB resp;
+    req.mutable_create_cluster()->set_cluster_root(cluster_root);
+    req.mutable_create_cluster()->set_num_tservers(1);
+    // leave_files defaults to false, but the shell won't reach the cleanup
+    // path when killed abnormally.
+    ASSERT_OK(SendReceive(req, &resp));
+  }
+
+  // Shell is already dead after the kill below; prevent TearDown from waiting
+  // on it again. Use SCOPED_CLEANUP so this runs even if an assertion fires.
+  SCOPED_CLEANUP({
+    proto_.reset();
+    shell_.reset();
+  });
+
+  // Kill the shell to force an abnormal exit that bypasses normal cleanup.
+  // SIGKILL is used instead of SIGTERM because it cannot be caught or handled.
+  ASSERT_OK(shell_->Kill(SIGKILL));
+  ASSERT_OK(shell_->Wait());
+  int exit_status;
+  ASSERT_OK(shell_->GetExitStatus(&exit_status));
+  ASSERT_NE(0, exit_status);
+
+  // Even though leave_files is false, the cluster root should still exist
+  // because the shell was killed before it could run cleanup.
+  ASSERT_TRUE(env_->FileExists(cluster_root));
+  ASSERT_OK(env_->DeleteRecursively(cluster_root));
 }
 
 static void CreateTableWithFlushedData(const string& table_name,
@@ -9766,6 +10100,49 @@ TEST_F(ToolTest, TestNonDefaultPrincipal) {
                          HostPort::ToCommaSeparatedString(cluster_->master_rpc_addrs())}));
 }
 
+// `diagnose tls_debug` is a security-diagnostic tool — it negotiates TLS
+// against a server but stops before authenticating. It must therefore work
+// against insecure clusters and against Kerberos-secured clusters whether
+// or not the caller has a TGT.
+TEST_F(ToolTest, TestTlsDebugInsecureCluster) {
+  ExternalMiniClusterOptions opts;
+  opts.enable_kerberos = false;
+  NO_FATALS(StartExternalMiniCluster(std::move(opts)));
+  const auto& master_addr = cluster_->master(0)->bound_rpc_addr().ToString();
+  string out;
+  NO_FATALS(RunActionStdoutString(
+      Substitute("diagnose tls_debug $0", master_addr), &out));
+  ASSERT_STR_CONTAINS(out, "Negotiated protocol: TLSv1");
+  ASSERT_STR_CONTAINS(out, "Negotiated ciphersuite:");
+}
+
+TEST_F(ToolTest, TestTlsDebugKerberizedNoTicket) {
+  ExternalMiniClusterOptions opts;
+  opts.enable_kerberos = true;
+  NO_FATALS(StartExternalMiniCluster(std::move(opts)));
+
+  // Drop the test process's TGT to prove the tool does not require one.
+  ASSERT_OK(cluster_->kdc()->Kdestroy());
+
+  const auto& master_addr = cluster_->master(0)->bound_rpc_addr().ToString();
+  string out;
+  NO_FATALS(RunActionStdoutString(
+      Substitute("diagnose tls_debug $0", master_addr), &out));
+  ASSERT_STR_CONTAINS(out, "Negotiated protocol: TLSv1");
+  ASSERT_STR_CONTAINS(out, "Negotiated ciphersuite:");
+}
+
+TEST_F(ToolTest, TestTlsDebugDisableTls) {
+  ExternalMiniClusterOptions opts;
+  opts.enable_kerberos = false;
+  NO_FATALS(StartExternalMiniCluster(std::move(opts)));
+  const auto& master_addr = cluster_->master(0)->bound_rpc_addr().ToString();
+  string out;
+  NO_FATALS(RunActionStdoutString(
+      Substitute("diagnose tls_debug --disable_tls $0", master_addr), &out));
+  ASSERT_STR_CONTAINS(out, "TLS was not negotiated - cleartext connection");
+}
+
 class UnregisterTServerTest : public ToolTest, public ::testing::WithParamInterface<bool> {
  public:
   void StartCluster() {
@@ -10764,6 +11141,93 @@ TEST_P(ListInFlightTablesTest, TestListInFlightTables) {
         &out));
     ASSERT_TRUE(out.empty()) << out;
   });
+}
+
+// Regression test for a bug where passing a tserver's flagfile to the CLI tool
+// causes a GROUP_FLAG_VALIDATOR failure. Previously the CLI inflated
+// rpc_max_message_size to ~2GB as a global flag default, causing the validator
+// to reject a flagfile-provided tablet_transaction_memory_limit_mb (e.g. 256MB
+// < 2GB). The fix moved the large RPC message size to the messenger layer so
+// it no longer affects the global flag and thus the validator.
+TEST_F(ToolTest, TestFlagfileOverrideTransactionMemoryLimit) {
+  // Create a flagfile similar to what a tserver might use, containing a
+  // tablet_transaction_memory_limit_mb value smaller than the CLI's old
+  // inflated rpc_max_message_size default.
+  const string flagfile_path = GetTestPath("tserver.flags");
+  ASSERT_OK(WriteStringToFile(env_,
+      "--tablet_transaction_memory_limit_mb=256\n",
+      flagfile_path));
+
+  // Run a CLI subcommand that triggers Action::Run() (where ValidateFlags()
+  // is called). "test mini_cluster" is lightweight and doesn't require a
+  // running cluster. Since the CLI no longer inflates rpc_max_message_size
+  // globally (it uses the compiled default of 50MB), 256MB > 50MB and the
+  // validator passes.
+  string stdout_str;
+  string stderr_str;
+  Status s = RunKuduTool(
+      { "--flagfile=" + flagfile_path, "test", "mini_cluster" },
+      &stdout_str, &stderr_str);
+  // The bug manifests as a non-zero exit with "Detected inconsistency in
+  // command-line flags" in stderr.
+  ASSERT_STR_NOT_CONTAINS(stderr_str,
+      "--tablet_transaction_memory_limit_mb is set too low compared with "
+      "--rpc_max_message_size");
+  ASSERT_OK(s);
+}
+
+// Verify that the CLI's BuildMessenger configures a large max message size
+// to handle huge RPC responses.
+TEST_F(ToolTest, TestBuildMessengerRespectsRpcMaxMessageSizeFlag) {
+  {
+    // Default case: flag untouched, messenger gets the large computed value.
+    // This assertion assumes available memory on the machine exceeds the
+    // default --rpc_max_message_size (50MB).
+    std::shared_ptr<rpc::Messenger> messenger;
+    ASSERT_TRUE(google::GetCommandLineFlagInfoOrDie(
+        "rpc_max_message_size").is_default);
+    ASSERT_OK(BuildMessenger("test", &messenger));
+    ASSERT_GT(messenger->rpc_max_message_size(), FLAGS_rpc_max_message_size);
+    messenger->Shutdown();
+  }
+  {
+    // Explicit flag: user sets --rpc_max_message_size, messenger honors it.
+    google::FlagSaver saver;
+    ASSERT_NE("", google::SetCommandLineOption(
+        "rpc_max_message_size", "104857600"));  // 100MB
+    std::shared_ptr<rpc::Messenger> messenger;
+    ASSERT_OK(BuildMessenger("test", &messenger));
+    ASSERT_EQ(104857600, messenger->rpc_max_message_size());
+    messenger->Shutdown();
+  }
+  {
+    // Edge case: flag explicitly set to the compiled default (50MB).
+    // is_default becomes false, so the messenger honors the explicit value
+    // rather than inflating to available_memory.
+    google::FlagSaver saver;
+    ASSERT_NE("", google::SetCommandLineOption(
+        "rpc_max_message_size", "52428800"));  // 50MB (the default)
+    ASSERT_FALSE(google::GetCommandLineFlagInfoOrDie(
+        "rpc_max_message_size").is_default);
+    std::shared_ptr<rpc::Messenger> messenger;
+    ASSERT_OK(BuildMessenger("test", &messenger));
+    ASSERT_EQ(52428800, messenger->rpc_max_message_size());
+    messenger->Shutdown();
+  }
+  {
+    // Assigning the default via FLAGS_xxx leaves is_default == true, and
+    // BuildMessenger auto-sizes based on available memory.
+    // NOTE: this scenario only occurs in test code; in production, flags are
+    // always set via command line or flagfiles (both mark is_default = false).
+    google::FlagSaver saver;
+    FLAGS_rpc_max_message_size = 52428800;  // 50MB (the default)
+    ASSERT_TRUE(google::GetCommandLineFlagInfoOrDie(
+        "rpc_max_message_size").is_default);
+    std::shared_ptr<rpc::Messenger> messenger;
+    ASSERT_OK(BuildMessenger("test", &messenger));
+    ASSERT_GT(messenger->rpc_max_message_size(), FLAGS_rpc_max_message_size);
+    messenger->Shutdown();
+  }
 }
 
 } // namespace tools

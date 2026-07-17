@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-
-#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -18,23 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Cython is a pre-requirement to be able to run this setup.py script.
-# By putting this part before the Cython imports there is no need to
-# install Cython manually before the installation.
+apiVersion: 1
 
-import sys
-import subprocess
-import pkg_resources
-
-cython_version = "Cython==0.29.37"
-
-# Function to install a package via pip
-def install(package):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-# Ensure the correct version of Cython is installed before proceeding
-try:
-    pkg_resources.require(cython_version)
-except (pkg_resources.DistributionNotFound, pkg_resources.VersionConflict):
-    sys.stdout.write("Installing Cython...")
-    install(cython_version)
+providers:
+  - name: kudu-demo
+    type: file
+    options:
+      path: /etc/grafana/provisioning/dashboards

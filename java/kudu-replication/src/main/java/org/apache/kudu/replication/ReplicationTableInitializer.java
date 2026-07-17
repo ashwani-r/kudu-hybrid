@@ -57,14 +57,10 @@ public class ReplicationTableInitializer implements AutoCloseable {
     this.config = config;
   }
 
-  public void createTableIfNotExists() throws Exception {
+  public void createTableIfNotExists() throws KuduException {
     if (!sinkClient.tableExists(config.getSinkTableName())) {
-      try {
-        sourceTable = sourceClient.openTable(config.getTableName());
-        createTableRangePartitionByRangePartition();
-      } catch (Exception e) {
-        throw new RuntimeException("Failed to create table " + config.getSinkTableName(), e);
-      }
+      sourceTable = sourceClient.openTable(config.getTableName());
+      createTableRangePartitionByRangePartition();
     }
   }
 
@@ -79,7 +75,7 @@ public class ReplicationTableInitializer implements AutoCloseable {
    * 2. Create table with first range (if any)
    * 3. Add remaining ranges via ALTER TABLE operations
    */
-  private void createTableRangePartitionByRangePartition() throws Exception {
+  private void createTableRangePartitionByRangePartition() throws KuduException {
     CreateTableOptions options = getCreateTableOptionsWithoutRangePartitions();
     List<Partition> rangePartitionsWithTableHashSchema =
             sourceTable.getRangePartitionsWithTableHashSchema(
@@ -95,27 +91,20 @@ public class ReplicationTableInitializer implements AutoCloseable {
       sinkClient.createTable(config.getSinkTableName(), sourceTable.getSchema(), options);
 
       // Add the rest of the range partitions with table wide hash schema through alters.
-      rangePartitionsWithTableHashSchema.stream().skip(1).forEach(partition -> {
+      for (Partition partition : rangePartitionsWithTableHashSchema.subList(
+          1, rangePartitionsWithTableHashSchema.size())) {
         AlterTableOptions alterOptions = new AlterTableOptions();
         alterOptions.addRangePartition(partition.getDecodedRangeKeyStart(sourceTable),
                 partition.getDecodedRangeKeyEnd(sourceTable));
-        try {
-          sinkClient.alterTable(config.getSinkTableName(), alterOptions);
-        } catch (KuduException e) {
-          throw new RuntimeException("Failed to alter table: " + config.getSinkTableName(), e);
-        }
-      });
+        sinkClient.alterTable(config.getSinkTableName(), alterOptions);
+      }
 
       // adds range partitions with custom hash schema through alters.
-      boundsWithCustomHashSchema.stream().forEach(partition -> {
+      for (RangePartitionWithCustomHashSchema partition : boundsWithCustomHashSchema) {
         AlterTableOptions alterOptions = new AlterTableOptions();
         alterOptions.addRangePartition(partition);
-        try {
-          sinkClient.alterTable(config.getSinkTableName(), alterOptions);
-        } catch (KuduException e) {
-          throw new RuntimeException("Failed to alter table: " + config.getSinkTableName(), e);
-        }
-      });
+        sinkClient.alterTable(config.getSinkTableName(), alterOptions);
+      }
 
 
     } else if (!boundsWithCustomHashSchema.isEmpty()) {
@@ -124,15 +113,12 @@ public class ReplicationTableInitializer implements AutoCloseable {
       sinkClient.createTable(config.getSinkTableName(), sourceTable.getSchema(), options);
 
       // Adds rest of range partitions with custom hash schema through alters.
-      boundsWithCustomHashSchema.stream().skip(1).forEach(partition -> {
+      for (RangePartitionWithCustomHashSchema partition : boundsWithCustomHashSchema.subList(
+          1, boundsWithCustomHashSchema.size())) {
         AlterTableOptions alterOptions = new AlterTableOptions();
         alterOptions.addRangePartition(partition);
-        try {
-          sinkClient.alterTable(config.getSinkTableName(), alterOptions);
-        } catch (KuduException e) {
-          throw new RuntimeException("Failed to alter table: " + config.getSinkTableName(), e);
-        }
-      });
+        sinkClient.alterTable(config.getSinkTableName(), alterOptions);
+      }
     }
 
   }

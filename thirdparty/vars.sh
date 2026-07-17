@@ -142,7 +142,7 @@ CURL_SOURCE=$TP_SOURCE_DIR/$CURL_NAME
 #  export NAME=crcutil-$(git rev-parse HEAD)
 #  git archive HEAD --prefix=$NAME/ -o /tmp/$NAME.tar.gz
 #  s3cmd put -P /tmp/$NAME.tar.gz s3://cloudera-thirdparty-libs/$NAME.tar.gz
-CRCUTIL_VERSION=2903870057d2f1f109b245650be29e856dc8b646
+CRCUTIL_VERSION=0437b1a99cf8a29910579ac440e48bb2385021b1
 CRCUTIL_NAME=crcutil-$CRCUTIL_VERSION
 CRCUTIL_SOURCE=$TP_SOURCE_DIR/$CRCUTIL_NAME
 
@@ -158,13 +158,6 @@ LLVM_SOURCE=$TP_SOURCE_DIR/$LLVM_NAME
 # The include-what-you-use is built along with LLVM in its source tree.
 IWYU_VERSION=0.15
 
-# Python is required to build LLVM 3.6+ because it uses
-# llvm/utils/llvm-build/llvmbuild script. It is only built and installed if
-# the system Python version is less than 2.7.
-PYTHON_VERSION=2.7.13
-PYTHON_NAME=python-$PYTHON_VERSION
-PYTHON_SOURCE=$TP_SOURCE_DIR/$PYTHON_NAME
-
 # Our trace-viewer repository is separate since it's quite large and
 # shouldn't change frequently. We upload the built artifacts (HTML/JS)
 # when we need to roll to a new revision.
@@ -175,8 +168,29 @@ TRACE_VIEWER_VERSION=99efe2f56191867ba7bb602c7c227dea6d576d2f
 TRACE_VIEWER_NAME=kudu-trace-viewer-$TRACE_VIEWER_VERSION
 TRACE_VIEWER_SOURCE=$TP_SOURCE_DIR/$TRACE_VIEWER_NAME
 
-BOOST_VERSION=1_84_0
-BOOST_NAME=boost_$BOOST_VERSION
+# Since 1.91.0 version, the distro file for the Boost library is a git archive,
+# not a regular/legacy source distribution archive which targets b2-based build
+# and available at https://archives.boost.org/release. The git archive
+# allows for building the Boost library with standard cmake and GNU make tools,
+# so it's possible to install the result artifacts into a staging area with
+# a pre-defined PREFIX using the DESTDIR approach. This is important for
+# pre-built 3rd-party components since they have to have a pre-defined prefix
+# independent of the layout of the local Kudu workspace.
+#
+# At the time of writing this, it's possible to download git archives
+# for the Boost library from https://github.com/boostorg/boost/releases page.
+# For 1.91.0 it's sourced from:
+#   https://github.com/boostorg/boost/releases/download/boost-1.91.0-1/boost-1.91.0-1-cmake.tar.gz
+# In some cases, the original archive might require repackaging to conform to
+# the layout convention for $KUDU_HOME/thirdparty/{build,src} directories.
+# For example, it's done so for 1.91.0 release to remove the extra '-1' suffix.
+#
+# References:
+#   https://www.boost.org/doc/user-guide/getting-started.html
+#   https://github.com/boostorg/cmake
+#   https://www.boost.org/doc/user-guide/building-with-cmake.html
+BOOST_VERSION=1.91.0
+BOOST_NAME=boost-$BOOST_VERSION
 BOOST_SOURCE=$TP_SOURCE_DIR/$BOOST_NAME
 
 # The breakpad source artifact is created using the script found in
@@ -200,7 +214,7 @@ SPARSEPP_VERSION=1.22
 SPARSEPP_NAME=sparsepp-$SPARSEPP_VERSION
 SPARSEPP_SOURCE=$TP_SOURCE_DIR/$SPARSEPP_NAME
 
-THRIFT_VERSION=0.21.0
+THRIFT_VERSION=0.23.0
 THRIFT_NAME=thrift-$THRIFT_VERSION
 THRIFT_SOURCE=$TP_SOURCE_DIR/$THRIFT_NAME
 
@@ -264,11 +278,11 @@ POSTGRES_JDBC_SOURCE=$TP_SOURCE_DIR/$POSTGRES_JDBC_NAME
 # mvn versions:set -DnewVersion=$(git rev-parse HEAD)
 # mvn versions:update-child-modules
 # mvn package -DskipTests
-RANGER_VERSION=2.1.0
+RANGER_VERSION=2.6.0
 RANGER_NAME=ranger-$RANGER_VERSION-admin
 RANGER_SOURCE=$TP_SOURCE_DIR/$RANGER_NAME
 
-RANGER_KMS_VERSION=2.1.0 # this probably should match the ranger version
+RANGER_KMS_VERSION=2.6.0 # this probably should match the ranger version
 RANGER_KMS_NAME=ranger-$RANGER_KMS_VERSION-kms
 RANGER_KMS_SOURCE=$TP_SOURCE_DIR/$RANGER_KMS_NAME
 
@@ -280,3 +294,20 @@ JWT_CPP_SOURCE=$TP_SOURCE_DIR/$JWT_CPP_NAME
 ROCKSDB_VERSION=7.7.3
 ROCKSDB_NAME=rocksdb-$ROCKSDB_VERSION
 ROCKSDB_SOURCE=$TP_SOURCE_DIR/$ROCKSDB_NAME
+
+# Prometheus is downloaded as a prebuilt binary from the S3 bucket.
+# OS and arch are mapped to the Prometheus release naming convention.
+#
+# To update to a new version:
+#   1. Download the tarballs for all supported OS/arch combinations from
+#      https://prometheus.io/download/
+#      (os: linux, darwin; arch: amd64, arm64 — four tarballs total)
+#   2. Upload each tarball to the S3 bucket:
+#      s3cmd put -P prometheus-<version>.<os>-<arch>.tar.gz \
+#        s3://cloudera-thirdparty-libs/
+#   3. Update PROMETHEUS_VERSION below.
+PROMETHEUS_VERSION=3.11.2
+PROMETHEUS_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+PROMETHEUS_ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+PROMETHEUS_NAME=prometheus-${PROMETHEUS_VERSION}.${PROMETHEUS_OS}-${PROMETHEUS_ARCH}
+PROMETHEUS_SOURCE=$TP_SOURCE_DIR/$PROMETHEUS_NAME

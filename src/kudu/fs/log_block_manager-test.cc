@@ -31,6 +31,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
@@ -61,15 +62,19 @@
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/strings/strcat.h"
 #include "kudu/gutil/strings/strip.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
 #include "kudu/util/env.h"
 #include "kudu/util/file_cache.h"
+#include "kudu/util/logging_test_util.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/random.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h" // IWYU pragma: keep
@@ -78,10 +83,12 @@
 #include "kudu/util/threadpool.h"
 
 using kudu::pb_util::ReadablePBContainerFile;
+using std::atomic;
 using std::make_tuple;
 using std::set;
 using std::string;
 using std::shared_ptr;
+using std::thread;
 using std::unique_ptr;
 using std::unordered_map;
 using std::unordered_set;
@@ -103,8 +110,11 @@ DECLARE_string(env_inject_eio_globs);
 DECLARE_uint64(log_container_preallocate_bytes);
 DECLARE_uint64(log_container_max_size);
 DECLARE_uint64(log_container_metadata_max_size);
+DECLARE_uint64(log_container_metadata_inmem_replay_threshold_bytes);
 DECLARE_bool(log_container_metadata_runtime_compact);
 DECLARE_double(log_container_metadata_size_before_compact_ratio);
+DECLARE_int32(log_block_manager_inject_latency_load_container_ms);
+DECLARE_uint64(fs_max_thread_count_per_data_dir);
 DEFINE_int32(startup_benchmark_batch_count_for_testing, 1000,
              "Batch operation (create and delete blocks) count to do startup benchmark.");
 DEFINE_int32(startup_benchmark_block_count_per_batch_for_testing, 1000,
@@ -118,6 +128,10 @@ DEFINE_double(startup_benchmark_deleted_block_percentage, 90.0,
 DEFINE_validator(startup_benchmark_deleted_block_percentage,
                  [](const char* /*n*/, double v) { return 0 <= v && v <= 100; });
 DECLARE_bool(encrypt_data_at_rest);
+#if !defined(NO_ROCKSDB)
+DECLARE_uint64(log_container_rdb_delete_batch_count);
+DECLARE_uint32(log_container_rdb_delete_fail_after_n_batches_for_tests);
+#endif
 
 // Block manager metrics.
 METRIC_DECLARE_counter(block_manager_total_blocks_deleted);
@@ -1174,11 +1188,9 @@ TEST_P(LogBlockManagerTest, StartupBenchmark) {
           to_delete_count / FLAGS_startup_benchmark_batch_count_for_testing;
       shared_ptr<BlockDeletionTransaction> deletion_transaction =
           this->bm_->NewDeletionTransaction();
-      for (; j < block_ids.size(); j++) {
+      for (; j < block_ids.size() && to_delete_count_per_batch > 0; j++) {
         deletion_transaction->AddDeletedBlock(block_ids[j]);
-        if (--to_delete_count_per_batch <= 0) {
-          break;
-        }
+        --to_delete_count_per_batch;
       }
       ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
     }
@@ -1198,7 +1210,269 @@ TEST_P(LogBlockManagerTest, StartupBenchmark) {
   }
   LOG(INFO) << "Test on --block_manager=" << FLAGS_block_manager;
 }
+
+// A/B micro-benchmark for the in-memory metadata replay optimization
+// introduced by --log_container_metadata_inmem_replay_threshold_bytes.
+//
+// The test populates the LBM with the same set of containers/records that
+// StartupBenchmark uses, then reopens the block manager twice:
+//   pass 1: --log_container_metadata_inmem_replay_threshold_bytes = 0
+//           (streaming, two preadv()s per record - the pre-optimization
+//            baseline);
+//   pass 2: --log_container_metadata_inmem_replay_threshold_bytes = 64MiB
+//           (in-memory replay, one bulk read per container - the optimized
+//            path).
+// Both passes run FLAGS_startup_benchmark_reopen_times reopens and use
+// SCOPED_LOG_TIMING; the resulting wall-clock numbers can be compared
+// directly. The optimization only applies to native-meta containers, so this
+// test is hung off LogBlockManagerNativeMetaTest. Both the encrypted and
+// non-encrypted parameterizations exercise the in-memory replay path
+// (encryption-aware as of KUDU-3779).
+TEST_P(LogBlockManagerNativeMetaTest, InMemoryReplayStartupBenchmark) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  google::FlagSaver flag_saver;
+
+  // Same preflush-disable trick as StartupBenchmark.
+  FLAGS_block_manager_preflush_control = "never";
+
+  vector<string> test_dirs;
+  {
+    SCOPED_LOG_TIMING(INFO, "init environment");
+    for (int i = 0; i < FLAGS_startup_benchmark_data_dir_count_for_testing; ++i) {
+      test_dirs.emplace_back(test_dir_ + "/" + std::to_string(i));
+    }
+    ASSERT_OK(ReopenBlockManager(nullptr, nullptr, nullptr, test_dirs, /* force= */ true));
+  }
+
+  vector<BlockId> block_ids;
+  block_ids.reserve(FLAGS_startup_benchmark_batch_count_for_testing *
+                    FLAGS_startup_benchmark_block_count_per_batch_for_testing);
+  {
+    SCOPED_LOG_TIMING(INFO, "create blocks");
+    for (int i = 0; i < FLAGS_startup_benchmark_batch_count_for_testing; i++) {
+      unique_ptr<BlockCreationTransaction> transaction = bm_->NewCreationTransaction();
+      for (int j = 0; j < FLAGS_startup_benchmark_block_count_per_batch_for_testing; j++) {
+        unique_ptr<WritableBlock> block;
+        ASSERT_OK_FAST(bm_->CreateBlock(test_block_opts_, &block));
+        ASSERT_OK_FAST(block->Append("x"));
+        ASSERT_OK_FAST(block->Finalize());
+        block_ids.emplace_back(block->id());
+        transaction->AddCreatedBlock(std::move(block));
+      }
+      ASSERT_OK(transaction->CommitCreatedBlocks());
+    }
+  }
+
+  int to_delete_count =
+      block_ids.size() * FLAGS_startup_benchmark_deleted_block_percentage / 100;
+  if (to_delete_count > 0) {
+    std::mt19937 gen(SeedRandom());
+    std::shuffle(block_ids.begin(), block_ids.end(), gen);
+
+    SCOPED_LOG_TIMING(INFO, "delete blocks");
+    int j = 0;
+    for (int i = 0; i < FLAGS_startup_benchmark_batch_count_for_testing; i++) {
+      int to_delete_count_per_batch =
+          to_delete_count / FLAGS_startup_benchmark_batch_count_for_testing;
+      shared_ptr<BlockDeletionTransaction> deletion_transaction =
+          this->bm_->NewDeletionTransaction();
+      for (; j < block_ids.size() && to_delete_count_per_batch > 0; j++) {
+        deletion_transaction->AddDeletedBlock(block_ids[j]);
+        --to_delete_count_per_batch;
+      }
+      ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
+    }
+  }
+
+  // Drain pending hole-punches before timing reopen, otherwise their cost
+  // bleeds into the first pass.
+  {
+    SCOPED_LOG_TIMING(INFO, "shutdown block manager");
+    bm_.reset();
+  }
+
+  // Pick any block that is guaranteed to be alive after the deletion loop
+  // above: after shuffling, the first 'to_delete_count' entries are deleted,
+  // so the tail of 'block_ids' survives. We use it for a per-pass sanity
+  // OpenBlock so the benchmark does not just measure replay but also verifies
+  // that the reopened LBM can actually serve a block.
+  BlockId sanity_block_id;
+  if (to_delete_count < static_cast<int>(block_ids.size())) {
+    sanity_block_id = block_ids.back();
+  }
+  auto sanity_open = [&]() {
+    if (sanity_block_id.IsNull()) return;
+    unique_ptr<ReadableBlock> rb;
+    ASSERT_OK(this->bm_->OpenBlock(sanity_block_id, &rb));
+  };
+
+  // Pass 1: streaming baseline (optimization disabled).
+  {
+    google::FlagSaver saver;
+    FLAGS_log_container_metadata_inmem_replay_threshold_bytes = 0;
+    LOG(INFO) << "InMemoryReplayStartupBenchmark: pass 1 (streaming, "
+                 "--log_container_metadata_inmem_replay_threshold_bytes=0)";
+    for (int i = 0; i < FLAGS_startup_benchmark_reopen_times; i++) {
+      SCOPED_LOG_TIMING(INFO, "reopening block manager [streaming]");
+      ASSERT_OK(ReopenBlockManager(nullptr, nullptr, nullptr, test_dirs));
+      NO_FATALS(sanity_open());
+    }
+    // Shutdown so pass 2 starts from the same on-disk state.
+    bm_.reset();
+  }
+
+  // Pass 2: in-memory replay (optimization enabled at the default 64 MiB).
+  {
+    google::FlagSaver saver;
+    FLAGS_log_container_metadata_inmem_replay_threshold_bytes = 64ULL * 1024 * 1024;
+    LOG(INFO) << "InMemoryReplayStartupBenchmark: pass 2 (in-memory, "
+                 "--log_container_metadata_inmem_replay_threshold_bytes=64MiB)";
+    for (int i = 0; i < FLAGS_startup_benchmark_reopen_times; i++) {
+      SCOPED_LOG_TIMING(INFO, "reopening block manager [in-memory]");
+      ASSERT_OK(ReopenBlockManager(nullptr, nullptr, nullptr, test_dirs));
+      NO_FATALS(sanity_open());
+    }
+  }
+  LOG(INFO) << "Test on --block_manager=" << FLAGS_block_manager;
+}
 #endif
+
+// KUDU-3779: regression test for the in-memory metadata replay path on
+// encrypted clusters. Exercises three properties that the streaming path used
+// to be the only one to provide:
+//   1. A reopen with the in-memory replay path (default flag value) returns
+//      exactly the same block set as a reopen with the streaming path
+//      (--log_container_metadata_inmem_replay_threshold_bytes=0), both for
+//      encrypted and non-encrypted metadata files.
+//   2. A metadata file with a zero-filled tail (the on-disk fingerprint of a
+//      crash mid-append: file size was persisted but data was not) is
+//      correctly recovered as an incomplete write and truncated back to its
+//      last valid record - even when the buffer slurped into memory contains
+//      the trailing-zero ciphertext.
+//   3. Threshold semantics: setting the flag to 0 forces streaming; setting
+//      it just below the cleartext payload size forces streaming for that
+//      file; setting it above forces in-memory replay. All three settings
+//      must reach the same block set on reopen.
+TEST_P(LogBlockManagerNativeMetaTest, TestInMemoryReplayRecoversTrailingZeros) {
+  google::FlagSaver flag_saver;
+
+  // Create a handful of blocks in a single container. Keep the count small so
+  // the test stays fast in debug builds; the in-memory path is exercised as
+  // long as we cross at least one record boundary.
+  constexpr int kNumBlocks = 16;
+  for (int i = 0; i < kNumBlocks; i++) {
+    unique_ptr<WritableBlock> writer;
+    ASSERT_OK(bm_->CreateBlock(test_block_opts_, &writer));
+    ASSERT_OK(writer->Append("payload"));
+    ASSERT_OK(writer->Close());
+  }
+
+  vector<BlockId> baseline;
+  ASSERT_OK(bm_->GetAllBlockIds(&baseline));
+  ASSERT_EQ(kNumBlocks, baseline.size());
+  std::sort(baseline.begin(), baseline.end());
+
+  const string container_path = LogBlockManager::ContainerPathForTests(
+      bm_->all_containers_by_name_.begin()->second.get());
+  const string metadata_path =
+      container_path + LogBlockManager::kContainerMetadataFileSuffix;
+
+  uint64_t good_meta_size;
+  ASSERT_OK(env_->GetFileSize(metadata_path, &good_meta_size));
+
+  // Helper: reopen, sort, compare against 'baseline'.
+  auto reopen_and_verify = [&]() {
+    ASSERT_OK(this->ReopenBlockManager());
+    vector<BlockId> ids;
+    ASSERT_OK(this->bm_->GetAllBlockIds(&ids));
+    std::sort(ids.begin(), ids.end());
+    ASSERT_EQ(baseline, ids);
+  };
+
+  // (1) Streaming-baseline vs. in-memory replay must produce the same block
+  // set. The default flag value (64 MiB) trivially admits this tiny metadata
+  // file, so the second reopen is guaranteed to take the in-memory path.
+  {
+    google::FlagSaver saver;
+    FLAGS_log_container_metadata_inmem_replay_threshold_bytes = 0;
+    NO_FATALS(reopen_and_verify());
+  }
+  {
+    google::FlagSaver saver;
+    FLAGS_log_container_metadata_inmem_replay_threshold_bytes =
+        64ULL * 1024 * 1024;
+    NO_FATALS(reopen_and_verify());
+  }
+
+  // (2) Trailing-zero recovery under in-memory replay. We extend the metadata
+  // file with a zero-filled tail (the on-disk fingerprint of a crash
+  // mid-append) and verify that reopen still succeeds, returns the original
+  // block set, and truncates the file back to its valid prefix. We do this
+  // with a few tail sizes for parity with TestMetadataTruncation, which
+  // historically exercised the streaming path only.
+  for (const auto tail_bytes : {1, 8, 128, 4096}) {
+    {
+      RWFileOptions opts;
+      opts.mode = Env::MUST_EXIST;
+      opts.is_sensitive = true;
+      unique_ptr<RWFile> file;
+      ASSERT_OK(env_->NewRWFile(opts, metadata_path, &file));
+      ASSERT_OK(file->Truncate(good_meta_size + tail_bytes));
+    }
+    uint64_t cur_meta_size;
+    ASSERT_OK(env_->GetFileSize(metadata_path, &cur_meta_size));
+    ASSERT_EQ(good_meta_size + tail_bytes, cur_meta_size);
+
+    google::FlagSaver saver;
+    FLAGS_log_container_metadata_inmem_replay_threshold_bytes =
+        64ULL * 1024 * 1024;
+    FLAGS_v = 1;
+    StringVectorSink log_sink;
+    {
+      ScopedRegisterSink srs(&log_sink);
+      NO_FATALS(reopen_and_verify());
+    }
+    int preload_log_lines = 0;
+    for (const string& msg : log_sink.logged_msgs()) {
+      if (msg.find("Preloaded metadata file " + metadata_path) !=
+          string::npos) {
+        ++preload_log_lines;
+      }
+    }
+    ASSERT_GE(preload_log_lines, 1)
+        << "expected MaybePreloadMetadataIntoMemory() to take the in-memory "
+        << "path for " << metadata_path << " (tail_bytes=" << tail_bytes
+        << "), but no preload log line was emitted";
+
+    // The reopen should have truncated the file back to its valid size.
+    ASSERT_OK(env_->GetFileSize(metadata_path, &cur_meta_size));
+    ASSERT_EQ(good_meta_size, cur_meta_size);
+  }
+
+  // (3) Threshold boundary: set the threshold to just below the metadata
+  // file's cleartext payload size. The preload step should bail out (payload
+  // exceeds threshold) and the streaming path should be used. Verifying we
+  // still get the same block set ensures the fallback wiring is correct.
+  ASSERT_OK(env_->GetFileSize(metadata_path, &good_meta_size));
+  unique_ptr<RandomAccessFile> probe;
+  RandomAccessFileOptions probe_opts;
+  probe_opts.is_sensitive = true;
+  ASSERT_OK(env_->NewRandomAccessFile(probe_opts, metadata_path, &probe));
+  const uint64_t header = probe->GetEncryptionHeaderSize();
+  ASSERT_GT(good_meta_size, header);
+  const uint64_t payload = good_meta_size - header;
+  {
+    google::FlagSaver saver;
+    FLAGS_log_container_metadata_inmem_replay_threshold_bytes = payload - 1;
+    NO_FATALS(reopen_and_verify());
+  }
+  {
+    google::FlagSaver saver;
+    FLAGS_log_container_metadata_inmem_replay_threshold_bytes = payload;
+    NO_FATALS(reopen_and_verify());
+  }
+}
 
 TEST_P(LogBlockManagerTest, TestFailMultipleTransactionsPerContainer) {
   // Create multiple transactions that will share a container.
@@ -1914,6 +2188,76 @@ TEST_P(LogBlockManagerNativeMetaTest, TestCompactFullContainerMetadataAtStartup)
   FsReport report;
   ASSERT_OK(ReopenBlockManager(nullptr, &report));
   ASSERT_EQ(last_live_aligned_bytes, report.stats.live_block_bytes_aligned);
+}
+
+// Exercises the in-memory metadata replay optimization for the native-meta
+// log block manager: at startup, when
+// --log_container_metadata_inmem_replay_threshold_bytes is non-zero and the
+// metadata file's payload fits within it, each container's metadata file is
+// slurped into memory once and replayed from there, instead of issuing two
+// preads per record.
+//
+// This test verifies that all three regimes (in-memory enabled, forced
+// fallback because the file is larger than the threshold, and feature
+// disabled) produce identical, correct results.
+TEST_P(LogBlockManagerNativeMetaTest, TestInMemoryMetadataReplay) {
+  google::FlagSaver flag_saver;
+
+  // Create enough blocks to populate the metadata file with many records.
+  // Using a single container keeps the test focused on the replay path.
+  FLAGS_log_container_max_blocks = 1000;
+  const int kNumBlocks = 200;
+
+  vector<BlockId> block_ids;
+  block_ids.reserve(kNumBlocks);
+  for (int i = 0; i < kNumBlocks; i++) {
+    unique_ptr<WritableBlock> block;
+    ASSERT_OK(bm_->CreateBlock(test_block_opts_, &block));
+    ASSERT_OK(block->Append("hello"));
+    ASSERT_OK(block->Close());
+    block_ids.emplace_back(block->id());
+  }
+
+  // Delete a fraction of blocks so the metadata also contains DELETE records.
+  {
+    shared_ptr<BlockDeletionTransaction> deletion_transaction =
+        bm_->NewDeletionTransaction();
+    for (int i = 0; i < kNumBlocks; i += 3) {
+      deletion_transaction->AddDeletedBlock(block_ids[i]);
+    }
+    ASSERT_OK(deletion_transaction->CommitDeletedBlocks(nullptr));
+  }
+
+  // Helper: reopen and verify that every still-live block is readable and
+  // every deleted block is no longer visible to the LBM.
+  auto verify_blocks_readable = [&]() {
+    ASSERT_OK(ReopenBlockManager());
+    for (int i = 0; i < kNumBlocks; i++) {
+      unique_ptr<ReadableBlock> rb;
+      Status s = bm_->OpenBlock(block_ids[i], &rb);
+      if (i % 3 == 0) {
+        // Deleted above: the LBM must report it as gone.
+        ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+        continue;
+      }
+      ASSERT_OK(s);
+      uint64_t sz = 0;
+      ASSERT_OK(rb->Size(&sz));
+      ASSERT_EQ(5, sz);
+    }
+  };
+
+  // 1) Default-sized in-memory replay (file is well below 64 MiB).
+  FLAGS_log_container_metadata_inmem_replay_threshold_bytes = 64ULL * 1024 * 1024;
+  NO_FATALS(verify_blocks_readable());
+
+  // 2) Force the streaming fallback by setting the threshold to 1 byte.
+  FLAGS_log_container_metadata_inmem_replay_threshold_bytes = 1;
+  NO_FATALS(verify_blocks_readable());
+
+  // 3) Disable the optimization entirely.
+  FLAGS_log_container_metadata_inmem_replay_threshold_bytes = 0;
+  NO_FATALS(verify_blocks_readable());
 }
 
 // Regression test for a bug in which, after a metadata file was compacted,
@@ -2870,7 +3214,238 @@ TEST_P(LogBlockManagerRdbMetaTest, TestHalfPresentContainer) {
     ASSERT_EQ(1, MetadataEntriesCount(container_name));
   }
 }
+
+// Tests that RemoveBlockIdsFromMetadata() correctly trims 'deleted_block_ids'
+// to only those blocks whose deletions were actually committed to RocksDB,
+// even when a write failure occurs partway through the batch loop.
+//
+// This is a regression test for a bug where 'deleted_block_ids' was populated
+// quite early before each write, causing it to include IDs from failed batch
+// writes. The caller uses deleted_block_ids.size() as the index of the first
+// failure, that can lead to incorrect number of deleted blocks and space leak.
+//
+// Test layout (batch_count=5, 10 total blocks, inject error for 2nd batch):
+//
+//   blocks [0..4]  — 1st batch, committed successfully via mid-loop flush
+//   blocks [5..9]  — 2nd batch, error injection triggers before its write
+TEST_P(LogBlockManagerRdbMetaTest, TestRemoveBlockIdsFromMetadataPartialFailure) {
+  ASSERT_OK(ReopenBlockManager());
+
+  // Two equal batches of 5. The first commits; the injection fires before
+  // the second, so its 5 blocks remain in RocksDB.
+  constexpr int kBatchSize = 5;
+  constexpr int kCommittedBlocks = kBatchSize;    // first batch:  blocks [0..4]
+  constexpr int kUncommittedBlocks = kBatchSize;  // second batch: blocks [5..9]
+  constexpr int kTotalBlocks = kCommittedBlocks + kUncommittedBlocks;  // 10
+
+  vector<BlockId> block_ids;
+  block_ids.reserve(kTotalBlocks);
+  for (int i = 0; i < kTotalBlocks; i++) {
+    unique_ptr<WritableBlock> writer;
+    ASSERT_OK(bm_->CreateBlock(test_block_opts_, &writer));
+    block_ids.push_back(writer->id());
+    ASSERT_OK(writer->Finalize());
+    ASSERT_OK(writer->Close());
+  }
+
+  // Capture container name and dir for RocksDB verification below.
+  // GetOnlyContainerDataFile() asserts there is exactly one data file,
+  // which also confirms all 10 blocks ended up in the same container.
+  string data_file_name;
+  NO_FATALS(GetOnlyContainerDataFile(&data_file_name));
+  Dir* pdir = dd_manager_->FindDirByFullPathForTests(data_file_name);
+  ASSERT_NE(nullptr, pdir);
+  vector<string> name_parts = Split(BaseName(data_file_name), ".", SkipEmpty());
+  ASSERT_FALSE(name_parts.empty());
+  string container_name = name_parts[0];
+
+  // Blocks [0..4] correspond to first batch that is committed on-disk.
+  // Blocks [5..9] correspond to second batch for which failure is triggered
+  // while committing to disk.
+  google::FlagSaver flag_saver;
+  FLAGS_log_container_rdb_delete_batch_count = kBatchSize;
+  FLAGS_log_container_rdb_delete_fail_after_n_batches_for_tests = 1;
+
+  vector<BlockId> deleted;
+  shared_ptr<BlockDeletionTransaction> txn = bm_->NewDeletionTransaction();
+  for (const auto& id : block_ids) {
+    txn->AddDeletedBlock(id);
+  }
+  Status s = txn->CommitDeletedBlocks(&deleted);
+  ASSERT_FALSE(s.ok()) << "Expected a failure from the injected error";
+
+  // With the fix, 'deleted' contains exactly kCommittedBlocks (5) entries.
+  // Before the fix, the early population would cause 'deleted' to include all 10
+  // block IDs (blocks [5..9] pushed before the injection check), masking the
+  // uncommitted deletions as false positive.
+  ASSERT_EQ(kCommittedBlocks, deleted.size());
+  for (int i = 0; i < kCommittedBlocks; i++) {
+    ASSERT_EQ(block_ids[i], deleted[i]);
+  }
+
+  // Confirm the RocksDB state directly.
+  auto* rdb = down_cast<RdbDir*>(pdir)->rdb();
+  const auto HasRdbEntry = [&](const BlockId& id) -> bool {
+    string key = LogBlockManagerRdbMeta::ConstructRocksDBKey(container_name, id);
+    string value;
+    return rdb->Get(rocksdb::ReadOptions(), rocksdb::Slice(key), &value).ok();
+  };
+  // Blocks [0..4]: deletion committed — must be absent from RDB.
+  for (int i = 0; i < kCommittedBlocks; i++) {
+    EXPECT_FALSE(HasRdbEntry(block_ids[i])) << "block " << i << " should be deleted";
+  }
+  // Blocks [5..9]: deletion not committed — must still be present in RDB.
+  for (int i = kCommittedBlocks; i < kTotalBlocks; i++) {
+    EXPECT_TRUE(HasRdbEntry(block_ids[i])) << "block " << i << " should NOT be deleted";
+  }
+}
 #endif
+
+// Verify that containers_processed tracks LoadContainer completion, not just
+// OpenContainer (file handle opening).
+TEST_P(LogBlockManagerTest, TestContainersProcessedTracksLoadCompletion) {
+  google::FlagSaver flag_saver;
+  constexpr int kNumContainers = 20;
+
+  // Force each block into its own container.
+  FLAGS_log_container_max_size = 1;
+  FLAGS_log_container_preallocate_bytes = 0;
+  {
+    unique_ptr<BlockCreationTransaction> transaction = bm_->NewCreationTransaction();
+    for (int i = 0; i < kNumContainers; i++) {
+      unique_ptr<WritableBlock> block;
+      ASSERT_OK(bm_->CreateBlock(test_block_opts_, &block));
+      ASSERT_OK(block->Append("a"));
+      transaction->AddCreatedBlock(std::move(block));
+    }
+    ASSERT_OK(transaction->CommitCreatedBlocks());
+  }
+
+  // Destroy the block manager. Set flags before reopening the directory
+  // manager so the per-dir thread pool picks them up.
+  bm_.reset();
+  FLAGS_log_block_manager_inject_latency_load_container_ms = 200;
+  FLAGS_fs_max_thread_count_per_data_dir = 1;
+  ASSERT_OK(DataDirManager::OpenExistingForTests(
+      env_, { test_dir_ }, DataDirManagerOptions(), &dd_manager_));
+  ASSERT_OK(dd_manager_->LoadDataDirGroupFromPB(test_tablet_name_, test_group_pb_));
+
+  atomic<int> containers_processed(0);
+  atomic<int> containers_total(0);
+
+  // Sample containers_processed in a background thread during Open().
+  atomic<bool> done(false);
+  // Track whether we ever observed a state where containers_processed < containers_total
+  // while Open() was still running. This proves the counter is no longer
+  // prematurely reaching 100%.
+  atomic<bool> saw_intermediate(false);
+
+  thread sampler([&] {
+    while (!done.load()) {
+      int p = containers_processed.load();
+      int t = containers_total.load();
+      if (t > 0 && p < t) {
+        saw_intermediate.store(true);
+      }
+      SleepFor(MonoDelta::FromMilliseconds(10));
+    }
+  });
+  SCOPED_CLEANUP({
+    done.store(true);
+    sampler.join();
+  });
+
+  bm_ = CreateBlockManager(scoped_refptr<MetricEntity>());
+  ASSERT_OK(bm_->Open(nullptr, BlockManager::MergeReport::NOT_REQUIRED,
+                      &containers_processed, &containers_total));
+
+  // Final values must be consistent.
+  ASSERT_EQ(containers_total.load(), containers_processed.load());
+  ASSERT_GE(containers_total.load(), kNumContainers);
+
+  // With 20 containers × 200ms delay and serial execution, the total load
+  // time is ~4s. The sampler polls every 10ms, so it must have observed
+  // an intermediate state where processed < total. The 200ms per-container
+  // delay also leaves a comfortable safety margin under TSAN, where the
+  // sampler thread may be descheduled for far longer than its 10ms sleep.
+  ASSERT_TRUE(saw_intermediate.load())
+      << "Expected to observe intermediate progress (processed < total) "
+      << "during Open(), but containers_processed jumped to total immediately. "
+      << "This indicates containers_processed is being incremented too early "
+      << "(after OpenContainer rather than after LoadContainer).";
+}
+
+// Verify that when OpenContainer() fails (returns Aborted), the failed
+// container is still counted in containers_processed so that progress
+// tracking doesn't stall at less than 100%.
+TEST_P(LogBlockManagerTest, TestOpenContainerFailureStillCountsProgress) {
+  google::FlagSaver flag_saver;
+  constexpr int kNumContainers = 10;
+
+  // Force each block into its own container.
+  FLAGS_log_container_max_size = 1;
+  FLAGS_log_container_preallocate_bytes = 0;
+  {
+    unique_ptr<BlockCreationTransaction> transaction = bm_->NewCreationTransaction();
+    for (int i = 0; i < kNumContainers; i++) {
+      unique_ptr<WritableBlock> block;
+      ASSERT_OK(bm_->CreateBlock(test_block_opts_, &block));
+      ASSERT_OK(block->Append("a"));
+      transaction->AddCreatedBlock(std::move(block));
+    }
+    ASSERT_OK(transaction->CommitCreatedBlocks());
+  }
+
+  // Find all container data files and corrupt one by truncating it to 0 bytes.
+  // This will cause OpenContainer() to return Aborted ("orphaned empty or
+  // invalid length file") for that container.
+  vector<string> container_names;
+  NO_FATALS(GetContainerNames(&container_names));
+  ASSERT_EQ(kNumContainers, container_names.size());
+
+  string data_file_to_corrupt = StrCat(container_names[0],
+                                       LogBlockManager::kContainerDataFileSuffix);
+  // Also truncate the metadata file (for NativeMeta) so both files appear
+  // empty/invalid, which guarantees the Aborted path regardless of backend.
+  string metadata_file_to_corrupt = StrCat(container_names[0],
+                                           LogBlockManager::kContainerMetadataFileSuffix);
+  {
+    unique_ptr<RWFile> file;
+    ASSERT_OK(env_->NewRWFile(data_file_to_corrupt, &file));
+    ASSERT_OK(file->Truncate(0));
+    ASSERT_OK(file->Close());
+  }
+  // Truncate metadata file if it exists (NativeMeta has it, RdbMeta does not).
+  if (env_->FileExists(metadata_file_to_corrupt)) {
+    unique_ptr<RWFile> file;
+    ASSERT_OK(env_->NewRWFile(metadata_file_to_corrupt, &file));
+    ASSERT_OK(file->Truncate(0));
+    ASSERT_OK(file->Close());
+  }
+
+  // Reopen the block manager with progress tracking.
+  bm_.reset();
+  ASSERT_OK(DataDirManager::OpenExistingForTests(
+      env_, { test_dir_ }, DataDirManagerOptions(), &dd_manager_));
+  ASSERT_OK(dd_manager_->LoadDataDirGroupFromPB(test_tablet_name_, test_group_pb_));
+
+  atomic<int> containers_processed(0);
+  atomic<int> containers_total(0);
+
+  bm_ = CreateBlockManager(scoped_refptr<MetricEntity>());
+  FsReport report;
+  ASSERT_OK(bm_->Open(&report, BlockManager::MergeReport::NOT_REQUIRED,
+                       &containers_processed, &containers_total));
+
+  // The corrupted container should appear in the incomplete_container_check.
+  ASSERT_GE(report.incomplete_container_check->entries.size(), 1);
+
+  // Key assertion: containers_processed must equal containers_total even
+  // though one container's OpenContainer() failed. Without the fix, the
+  // failed container would not be counted, leaving processed < total.
+  ASSERT_EQ(containers_total.load(), containers_processed.load());
+  ASSERT_EQ(kNumContainers, containers_total.load());
+}
 
 } // namespace fs
 } // namespace kudu

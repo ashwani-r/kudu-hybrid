@@ -19,6 +19,7 @@ apply from: "$rootDir/gradle/protobuf.gradle"
 
 dependencies {
   implementation libs.protobufJava
+  compileOnly libs.annotations
 }
 
 // Add protobuf files to the proto source set.
@@ -39,6 +40,10 @@ javadoc {
   enabled = false
 }
 
+// SpotBugs is not actionable on generated protobuf classes and emits
+// pervasive false positives (e.g. getDescriptor()/singleton patterns).
+tasks.named("spotbugsMain") { enabled = false }
+tasks.named("spotbugsTest") { enabled = false }
+
 // Skip publishing kudu-proto artifact because it will always be shaded into kudu-client.
-publish.enabled = false
-publishToMavenLocal.enabled = false
+disablePublishing()

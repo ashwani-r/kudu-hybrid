@@ -25,7 +25,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rebalance/rebalancer.h"
 #include "kudu/util/countdown_latch.h"
@@ -33,7 +32,9 @@
 
 namespace kudu {
 
+class Counter;
 class HostPort;
+class MetricEntity;
 class Thread;
 
 namespace rebalance {
@@ -66,11 +67,13 @@ enum CrossLocations {
 class AutoRebalancerTask {
  public:
 
-  AutoRebalancerTask(CatalogManager* catalog_manager, TSManager* ts_manager);
+  AutoRebalancerTask(CatalogManager* catalog_manager,
+                     TSManager* ts_manager,
+                     const scoped_refptr<MetricEntity>& metric_entity);
   ~AutoRebalancerTask();
 
   // Initializes the auto-rebalancer.
-  Status Init() WARN_UNUSED_RESULT;
+  Status Init();
 
   // Shuts down the auto-rebalancer. This must be called
   // before shutting down the catalog manager.
@@ -132,14 +135,13 @@ class AutoRebalancerTask {
       HostPort* leader_hp) const;
 
   // Finds replicas that are specified in 'replica_moves' and make requests
-  // to have them moved in order to rebalance the cluster.
-  // Returns a non-OK status if the replica or the replica's tserver
-  // cannot be found, or the request to move the replica cannot be completed.
+  // to have them moved in order to rebalance the cluster. Per-move failures
+  // are logged individually; failed moves are removed from 'replica_moves'.
   //
   // Some information used to clear the replace marker if moves fail will be
   // added to the ReplicaMoves in this method.
-  Status ExecuteMoves(
-      const std::vector<rebalance::Rebalancer::ReplicaMove>& replica_moves);
+  void ExecuteMoves(
+      std::vector<rebalance::Rebalancer::ReplicaMove>* replica_moves);
 
   // Given a set of replica moves, return Status::OK() if checking completion
   // progress does not encounter an error. Otherwise, return the first error
@@ -165,6 +167,20 @@ class AutoRebalancerTask {
   Status CheckMoveCompleted(
       const rebalance::Rebalancer::ReplicaMove& replica_move,
       bool* is_complete);
+
+  // Makes a single attempt to clear the source peer's replace marker for
+  // 'move', sending a MODIFY_PEER (replace=false) BulkChangeConfig to the
+  // tablet leader. Returns NotFound if the peer is already gone from the
+  // config, or InvalidArgument if the marker was already cleared; callers
+  // treat both as success.
+  Status TryClearReplaceMarker(const rebalance::Rebalancer::ReplicaMove& move);
+
+  // Retries the replace-marker cleanups that didn't succeed within the inline
+  // retry budget. Runs at the top of every RunLoop iteration, even when
+  // rebalancing is disabled, so a marker doesn't stay stuck just because the
+  // consensus state happened to be transient when we first tried (leader
+  // transfer, pending config change, connection refused, and so on).
+  void ProcessPendingReplaceClears();
 
   // The associated catalog manager.
   CatalogManager* catalog_manager_;
@@ -194,8 +210,19 @@ class AutoRebalancerTask {
   // Key is the tserver UUID, value is the count of ongoing moves.
   std::unordered_map<std::string, int> moves_per_tserver_;
 
+  // Observability counters.
+  scoped_refptr<Counter> leader_moves_scheduled_;
+  scoped_refptr<Counter> follower_moves_scheduled_;
+  scoped_refptr<Counter> rounds_completed_;
+
+  // Replica moves whose replace-marker cleanup did not succeed within the
+  // inline retry budget. Reprocessed by ProcessPendingReplaceClears() at
+  // the top of every RunLoop iteration.
+  std::vector<rebalance::Rebalancer::ReplicaMove> pending_replace_clears_;
+
   // Variables for testing.
   std::atomic<int> number_of_loop_iterations_for_test_;
+  std::atomic<int> moves_attempted_this_round_for_test_;
   std::atomic<int> moves_scheduled_this_round_for_test_;
 };
 

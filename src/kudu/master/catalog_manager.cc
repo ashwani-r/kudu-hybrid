@@ -748,7 +748,7 @@ class CatalogManagerBgTasks {
 
   ~CatalogManagerBgTasks() {}
 
-  Status Init() WARN_UNUSED_RESULT;
+  Status Init();
   void Shutdown();
 
   void Wake() {
@@ -986,7 +986,8 @@ CatalogManager::CatalogManager(Master* master)
       hms_notification_log_event_id_(-1),
       leader_lock_(RWMutex::Priority::PREFER_WRITING),
       ipki_private_key_password_(""),
-      tsk_private_key_password_("") {
+      tsk_private_key_password_(""),
+      is_joining_existing_cluster_(false) {
   if (RangerAuthzProvider::IsEnabled()) {
     authz_provider_.reset(new RangerAuthzProvider(master_->fs_manager()->GetEnv(),
                                                   master_->metric_entity()));
@@ -1006,6 +1007,30 @@ CatalogManager::~CatalogManager() {
   Shutdown();
 }
 
+Status CatalogManager::SetJoiningCluster(bool joining_existing_cluster) {
+  // Shutdown the Catalog Manager to avoid propagating incorrect state of the system catalog
+  // table as the table will be replaced via AddMaster() anyway. See KUDU-3762.
+  // Before shutting down, ensure we are setting the flag from false to true before shutting down
+  // the catalog manager.
+  if (!is_joining_existing_cluster_ && joining_existing_cluster) {
+    if (PREDICT_FALSE(!this->IsInitialized())) {
+      return(Status::ServiceUnavailable(
+            Substitute("Catalog manager is not initialized.")));
+    }
+    if (PREDICT_FALSE(this->state_ != kRunning)) {
+      return(Status::ServiceUnavailable(
+            Substitute("Catalog manager is not running.")));
+    }
+    LOG(INFO) << "Shutting down the Catalog Manager";
+    this->Shutdown();
+  }
+  is_joining_existing_cluster_ = joining_existing_cluster;
+  return Status::OK();
+}
+
+bool CatalogManager::IsJoiningCluster() const {
+  return is_joining_existing_cluster_;
+}
 Status CatalogManager::Init(bool is_first_run) {
   {
     std::lock_guard l(state_lock_);
@@ -1024,7 +1049,8 @@ Status CatalogManager::Init(bool is_first_run) {
   RETURN_NOT_OK_PREPEND(sys_catalog_->WaitUntilRunning(),
                         "Failed waiting for the catalog tablet to run");
 
-  unique_ptr<AutoRebalancerTask> task(new AutoRebalancerTask(this, master_->ts_manager()));
+  unique_ptr<AutoRebalancerTask> task(
+      new AutoRebalancerTask(this, master_->ts_manager(), master_->metric_entity()));
   RETURN_NOT_OK_PREPEND(task->Init(), "failed to initialize auto-rebalancing task");
   auto_rebalancer_ = std::move(task);
 
@@ -6653,6 +6679,24 @@ Status CatalogManager::GetTabletLocations(const string& tablet_id,
 
   return BuildLocationsForTablet(
       tablet_info, filter, use_external_addr, locs_pb, ts_infos_dict);
+}
+
+Status CatalogManager::GetTabletConsensusState(const string& tablet_id,
+                                               ConsensusStatePB* cstate) const {
+  leader_lock_.AssertAcquiredForReading();
+  scoped_refptr<TabletInfo> tablet_info;
+  {
+    shared_lock l(lock_);
+    if (!FindCopy(tablet_map_, tablet_id, &tablet_info)) {
+      return Status::NotFound(Substitute("Unknown tablet $0", tablet_id));
+    }
+  }
+  TabletMetadataLock tablet_l(tablet_info.get(), LockMode::READ);
+  if (!tablet_l.data().pb.has_consensus_state()) {
+    return Status::NotFound(Substitute("No consensus state for tablet $0", tablet_id));
+  }
+  *cstate = tablet_l.data().pb.consensus_state();
+  return Status::OK();
 }
 
 Status CatalogManager::ReplaceTablet(const string& tablet_id, ReplaceTabletResponsePB* resp) {

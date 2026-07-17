@@ -19,11 +19,15 @@
 // consistently when a subproject requires shaded artifacts.
 
 import org.gradle.api.internal.artifacts.publish.ArchivePublishArtifact
-apply plugin: "com.github.johnrengelman.shadow"
+apply plugin: "com.gradleup.shadow"
 
-knows.enabled = false // Disable the "easter egg" knows task.
-knows.group = "" // Hide the "easter egg" knows task.
-shadowJar.group = "" // Hide shadowJar task since it's used by the default build.
+tasks.matching { it.name == "knows" }.configureEach {
+  enabled = false // Disable the "easter egg" knows task.
+  group = "" // Hide the "easter egg" knows task.
+}
+tasks.named("shadowJar") {
+  group = "" // Hide shadowJar task since it's used by the default build.
+}
 
 // Add a property to explicitly allow slf4j shading.
 ext {
@@ -31,9 +35,9 @@ ext {
 }
 
 // Configure a shaded jar to replace the default jar
-shadowJar.classifier = null // Configure shadow jar to have the default classifier.
+shadowJar.archiveClassifier = "" // Configure shadow jar to have the default classifier.
 jar.finalizedBy(shadowJar)  // Generate the shaded jar anytime the jar task is run.
-jar.classifier = "unshaded" // Add an unshaded classifier to the default jar.
+jar.archiveClassifier = "unshaded" // Add an unshaded classifier to the default jar.
 
 // Add the shadowJar to the published artifacts.
 artifacts {
@@ -51,7 +55,7 @@ shadowJar {
   dependencies {
     // Excluding bouncycastle due to:
     // https://github.com/apache/hadoop/blob/4d7825309348956336b8f06a08322b78422849b1/hadoop-client-modules/hadoop-client-runtime/pom.xml#L156-L157
-    exclude dependency("org.bouncycastle::.*")
+    exclude dependency("org.bouncycastle:.*:.*")
   }
   // TODO(achennaka): Figure out a better way to deal with MR-JAR specific files. For now
   // we exclude everything as there were no failures seen but probably we need to exclude

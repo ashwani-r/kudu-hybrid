@@ -83,7 +83,7 @@ public class ErrorCollector {
   }
 
   /**
-   * Resize ErrorCollector. If size < errorQueue.size(),
+   * Resize ErrorCollector. If {@code size < errorQueue.size()},
    * the oldest errors will be discarded and overflowed will be set;
    */
   public synchronized void resize(int size) {

@@ -312,7 +312,7 @@ public class KuduTable {
    */
   @InterfaceAudience.LimitedPrivate("Impala")
   @InterfaceStability.Unstable
-  public List<String> getFormattedRangePartitions(long timeout) throws Exception {
+  public List<String> getFormattedRangePartitions(long timeout) {
     List<Partition> rangePartitions = getRangePartitions(timeout);
     List<String> formattedPartitions = new ArrayList<>();
     for (Partition partition : rangePartitions) {
@@ -331,8 +331,7 @@ public class KuduTable {
    */
   @InterfaceAudience.LimitedPrivate("Impala")
   @InterfaceStability.Unstable
-  public List<String> getFormattedRangePartitionsWithHashSchema(long timeout)
-      throws Exception {
+  public List<String> getFormattedRangePartitionsWithHashSchema(long timeout) {
     List<Partition> rangePartitions = getRangePartitions(timeout);
     List<String> formattedPartitions = new ArrayList<>();
     for (Partition partition : rangePartitions) {
@@ -350,7 +349,7 @@ public class KuduTable {
    */
   @InterfaceAudience.Private
   @InterfaceStability.Unstable
-  public List<Partition> getRangePartitions(long timeout) throws Exception {
+  public List<Partition> getRangePartitions(long timeout) {
     // TODO: This could be moved into the RangeSchemaPB returned from server
     // to avoid an extra call to get the range partitions.
     return getRangePartitionsHelper(timeout, false);
@@ -365,7 +364,7 @@ public class KuduTable {
    */
   @InterfaceAudience.Private
   @InterfaceStability.Unstable
-  public List<Partition> getRangePartitionsWithTableHashSchema(long timeout) throws Exception {
+  public List<Partition> getRangePartitionsWithTableHashSchema(long timeout) {
     return getRangePartitionsHelper(timeout, true);
   }
 
@@ -378,7 +377,7 @@ public class KuduTable {
    * @return a list of the formatted range partitions
    */
   private List<Partition> getRangePartitionsHelper(long timeout,
-                                                   boolean onlyTableHashSchema) throws Exception {
+                                                   boolean onlyTableHashSchema) {
     List<Partition> rangePartitions = new ArrayList<>();
     List<KuduScanToken> scanTokens = new KuduScanToken.KuduScanTokenBuilder(client, this)
         .setTimeout(timeout)

@@ -128,6 +128,7 @@ public class TestKuduClientSecurity {
 
 
   @Test(timeout = 100000)
+  @SuppressWarnings("deprecation")
   public void testCustomNioExecutor() throws Exception {
     long startTime = System.nanoTime();
     try (KuduClient localClient =

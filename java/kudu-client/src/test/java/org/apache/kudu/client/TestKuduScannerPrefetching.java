@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.collect.ImmutableList;
 import org.junit.Assert;
@@ -64,7 +65,7 @@ public class TestKuduScannerPrefetching {
   private Exception failureException;
 
   private KuduTable table;
-  private long runtimeInSeconds;
+  private volatile long runtimeInSeconds;
 
   private volatile long sharedWriteTimestamp;
 
@@ -127,7 +128,8 @@ public class TestKuduScannerPrefetching {
       throw failureException;
     }
     Assert.assertTrue(wt.currentRowKey + " should be higher than 0", wt.currentRowKey > 0);
-    Assert.assertTrue(st.totalRowCount + " should be higher than 0", st.totalRowCount > 0);
+    Assert.assertTrue(st.totalRowCount.get() + " should be higher than 0",
+        st.totalRowCount.get() > 0);
   }
 
   /**
@@ -194,7 +196,7 @@ public class TestKuduScannerPrefetching {
    */
   class ScannerThread implements Runnable {
     // Updated by calling a full scan.
-    private int totalRowCount = 0;
+    private final AtomicInteger totalRowCount = new AtomicInteger();
 
     @Override
     public void run() {
@@ -209,7 +211,7 @@ public class TestKuduScannerPrefetching {
           return;
         }
 
-        if (totalRowCount == 0) {
+        if (totalRowCount.get() == 0) {
           try {
             keepRunningLatch.await(50, TimeUnit.MILLISECONDS);
           } catch (InterruptedException e) {
@@ -243,7 +245,7 @@ public class TestKuduScannerPrefetching {
           return checkAndReportError("Got error while row counting", e);
         }
         Assert.assertEquals(rowCount, rowCount2);
-        totalRowCount += rowCount;
+        totalRowCount.addAndGet(rowCount);
         // Due to the lack of KUDU-430, we need to loop for a while.
         try {
           keepRunningLatch.await(50, TimeUnit.MILLISECONDS);

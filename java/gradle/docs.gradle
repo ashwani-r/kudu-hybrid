@@ -17,30 +17,16 @@
 
 // This file contains common tasks and configuration for documentation generation.
 
-configurations {
-  doclet
-}
-
-dependencies {
-  doclet libs.yetusAnnotations
-}
-
 // Javadoc Configuration
 // We use afterEvaluate to add additional configuration once all the definitions
 // in the projects build script have been applied
 afterEvaluate {
   tasks.withType(Javadoc) {
-    if(JavaVersion.current().isJava10Compatible()) {
-      // Disable Javadoc generation on Java 10+ until it is fixed.
-      enabled = false
-    }
-    // Configure the Yetus doclet
-    options.docletpath = configurations.doclet.files.asType(List)
-    options.doclet = "org.apache.yetus.audience.tools.IncludePublicAnnotationsStandardDoclet"
+    options.noTimestamp = true
+    // Existing Kudu Javadocs predate the stricter JDK 17 doclint checks.
+    // Keep generating docs while avoiding a large comment-only cleanup.
+    options.addBooleanOption("Xdoclint:none", true)
     // Link to Java SE javadoc
-    options.links "https://docs.oracle.com/javase/$javaCompatibility/docs/api/"
-    // Hacky workaround to YETUS-627. Replace with options.noTimestamp
-    // once this workaround is no longer needed.
-    options.addStringOption("notimestamp", "org.apache.kudu")
+    options.links "https://docs.oracle.com/en/java/javase/17/docs/api/"
   }
 }

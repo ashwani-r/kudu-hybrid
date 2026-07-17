@@ -460,7 +460,7 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
      * Sets the data size of key range. It is used to split tablet's primary key range
      * into smaller ranges. The split doesn't change the layout of the tablet. This is a hint:
      * The tablet server may return the size of key range larger or smaller than this value.
-     * If unset or <= 0, the key range includes all the data of the tablet.
+     * If unset or {@code <= 0}, the key range includes all the data of the tablet.
      * @param splitSizeBytes the data size of key range.
      */
     public KuduScanTokenBuilder setSplitSizeBytes(long splitSizeBytes) {

@@ -223,6 +223,8 @@ class LogBlockManager : public BlockManager {
 
   FRIEND_TEST(LogBlockManagerNativeMetaTest,
               TestContainerBlockLimitingByMetadataSizeWithCompaction);
+  FRIEND_TEST(LogBlockManagerNativeMetaTest,
+              TestInMemoryReplayRecoversTrailingZeros);
   FRIEND_TEST(LogBlockManagerNativeMetaTest, TestMetadataTruncation);
   FRIEND_TEST(LogBlockManagerTest, TestAbortBlock);
   FRIEND_TEST(LogBlockManagerTest, TestCloseFinalizedBlock);
@@ -550,7 +552,7 @@ class LogBlockManager : public BlockManager {
 // metadata is simple and performant at open time.
 class LogBlockManagerNativeMeta : public LogBlockManager {
  public:
-  static constexpr const char* const name() { return "log"; }
+  static constexpr const char* name() { return "log"; }
 
   LogBlockManagerNativeMeta(Env* env,
                             scoped_refptr<DataDirManager> dd_manager,
@@ -618,7 +620,7 @@ private:
 // the read/write and space amplification.
 class LogBlockManagerRdbMeta : public LogBlockManager {
  public:
-  static constexpr const char* const name() { return "logr"; }
+  static constexpr const char* name() { return "logr"; }
 
   LogBlockManagerRdbMeta(Env* env,
                          scoped_refptr<DataDirManager> dd_manager,
@@ -634,6 +636,7 @@ class LogBlockManagerRdbMeta : public LogBlockManager {
   friend class internal::LogBlockContainerRdbMeta;
   friend class RdbMetadataLBMCorruptor;
   FRIEND_TEST(LogBlockManagerRdbMetaTest, TestHalfPresentContainer);
+  FRIEND_TEST(LogBlockManagerRdbMetaTest, TestRemoveBlockIdsFromMetadataPartialFailure);
 
   size_t EstimateContainerCount(size_t children_count) const override {
     // TODO(yingchun): exclude the kRocksDBDirName directory when get the children count.

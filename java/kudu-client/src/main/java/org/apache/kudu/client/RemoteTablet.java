@@ -24,7 +24,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Random;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
@@ -63,7 +63,8 @@ public class RemoteTablet implements Comparable<RemoteTablet> {
   // process and therefore also better cache affinity while ensuring that we can
   // still benefit from spreading the load across replicas for other processes
   // and applications.
-  private static final int RANDOM_SELECTION_INT = new Random().nextInt(Integer.MAX_VALUE);
+  private static final int RANDOM_SELECTION_INT = ThreadLocalRandom.current()
+      .nextInt(Integer.MAX_VALUE);
 
   private final String tableId;
   private final String tabletId;
@@ -101,7 +102,7 @@ public class RemoteTablet implements Comparable<RemoteTablet> {
     }
 
     if (leaderUuid == null) {
-      LOG.warn("No leader provided for tablet {}", getTabletId());
+      LOG.warn("No leader provided for tablet {}", tabletId);
     }
     this.replicas.set(replicasBuilder.build());
   }
@@ -261,7 +262,8 @@ public class RemoteTablet implements Comparable<RemoteTablet> {
       case CLOSEST_REPLICA:
         return getClosestServerInfo(location);
       default:
-        throw new RuntimeException("unknown replica selection mechanism " + replicaSelection);
+        throw new IllegalArgumentException(
+            "unknown replica selection mechanism " + replicaSelection);
     }
   }
 

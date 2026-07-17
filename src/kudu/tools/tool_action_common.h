@@ -24,12 +24,11 @@
 #include <vector>
 
 #include "kudu/client/shared_ptr.h" // IWYU pragma: keep
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/response_callback.h"
 #include "kudu/tools/tool_action.h"
-#include "kudu/util/net/net_util.h"
 #include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -280,7 +279,7 @@ class DataTable {
   void AddColumn(std::string name, std::vector<std::string> column);
 
   // Print the table to 'out'.
-  Status PrintTo(std::ostream& out) const WARN_UNUSED_RESULT;
+  Status PrintTo(std::ostream& out) const;
  private:
   std::vector<std::string> column_names_;
   std::vector<std::vector<std::string>> columns_;
@@ -316,8 +315,7 @@ class LeaderMasterProxy {
                                           const Req&, Resp*,
                                           rpc::RpcController*,
                                           const rpc::ResponseCallback&)>& func,
-                 std::vector<uint32_t> required_feature_flags = {})
-      WARN_UNUSED_RESULT;
+                 std::vector<uint32_t> required_feature_flags = {});
 
  private:
   client::sp::shared_ptr<client::KuduClient> client_;

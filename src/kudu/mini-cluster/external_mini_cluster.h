@@ -35,7 +35,6 @@
 
 #include "kudu/common/common.pb.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/mini-cluster/mini_cluster.h"
 #include "kudu/security/test/mini_kdc.h"
@@ -251,6 +250,12 @@ struct ExternalMiniClusterOptions {
   // Default: HmsMode::NONE.
   HmsMode hms_mode;
 
+  // If true, enable SSL/TLS for the Hive Metastore started as part of this
+  // ExternalMiniCluster.
+  //
+  // Default: false.
+  bool enable_hms_tls;
+
   // If true, set up a Ranger service as part of this ExternalMiniCluster.
   //
   // Default: false.
@@ -348,6 +353,9 @@ struct ExternalMiniClusterOptions {
 // of the daemons.
 class ExternalMiniCluster : public MiniCluster {
  public:
+  // The absolute path to the default cluster root location.
+  static std::string GetDefaultClusterRoot();
+
   // Constructs a cluster with the default options.
   ExternalMiniCluster();
 
@@ -557,7 +565,7 @@ class ExternalMiniCluster : public MiniCluster {
   // is considered unsafe to change at runtime, it is changed.
   Status SetFlag(ExternalDaemon* daemon,
                  const std::string& flag,
-                 const std::string& value) WARN_UNUSED_RESULT;
+                 const std::string& value);
 
   // Enable Hive Metastore integration.
   // Overrides HMS integration options set by ExternalMiniClusterOptions.
@@ -746,10 +754,10 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
   Status SetEncryptionKey(const std::string& tenant_id = kDefaultTenantID);
 
   // Sends a SIGSTOP signal to the daemon.
-  Status Pause() WARN_UNUSED_RESULT;
+  Status Pause();
 
   // Sends a SIGCONT signal to the daemon.
-  Status Resume() WARN_UNUSED_RESULT;
+  Status Resume();
 
   // Return true if we have explicitly shut down the process.
   bool IsShutdown() const;
@@ -777,7 +785,7 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
   virtual void Shutdown();
 
   // Delete files specified by 'wal_dir_' and 'data_dirs_'.
-  Status DeleteFromDisk() const WARN_UNUSED_RESULT;
+  Status DeleteFromDisk() const;
 
   const std::string& wal_dir() const { return opts_.wal_dir; }
 
@@ -891,7 +899,7 @@ class ExternalMaster : public ExternalDaemon {
 
   // Restarts the daemon.
   // Requires that it has previously been shutdown.
-  Status Restart() override WARN_UNUSED_RESULT;
+  Status Restart() override;
 
   Env* env() const override { return env_.get(); }
 
@@ -907,7 +915,7 @@ class ExternalMaster : public ExternalDaemon {
     DONT_WAIT_FOR_LEADERSHIP
   };
   Status WaitForCatalogManager(
-      WaitMode wait_mode = DONT_WAIT_FOR_LEADERSHIP) WARN_UNUSED_RESULT;
+      WaitMode wait_mode = DONT_WAIT_FOR_LEADERSHIP);
 
   // Get all flags for a master from the supplied 'opts'.
   // It does not include executable or any positional arguments like "master run".
@@ -934,7 +942,7 @@ class ExternalTabletServer : public ExternalDaemon {
 
   // Restarts the daemon.
   // Requires that it has previously been shutdown.
-  Status Restart() override WARN_UNUSED_RESULT;
+  Status Restart() override;
 
   Env* env() const override { return env_.get(); }
  private:

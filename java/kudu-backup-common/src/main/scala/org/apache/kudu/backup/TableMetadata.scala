@@ -465,7 +465,7 @@ object TableMetadata {
     metadata.getPartitions.getRangeAndHashPartitionsList.asScala.map { rhp =>
       val hashSchemas = rhp.getHashPartitionsList.asScala.map { hp =>
         val colIds = hp.getColumnNamesList.asScala.map { name =>
-          new Integer(schema.getColumnIndex(schema.getColumnId(name)))
+          Integer.valueOf(schema.getColumnIndex(schema.getColumnId(name)))
         }
         new HashBucketSchema(colIds.asJava, hp.getNumBuckets, hp.getSeed)
       }

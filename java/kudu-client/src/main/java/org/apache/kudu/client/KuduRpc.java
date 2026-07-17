@@ -33,6 +33,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.collect.ImmutableList;
 import com.google.protobuf.CodedOutputStream;
@@ -154,18 +155,31 @@ public abstract class KuduRpc<R> {
   ExternalConsistencyMode externalConsistencyMode = CLIENT_PROPAGATED;
 
   /**
-   * How many times have we retried this RPC?.
-   * Proper synchronization is required, although in practice most of the code
-   * that access this attribute will have a happens-before relationship with
-   * the rest of the code, due to other existing synchronization.
+   * How many times have we retried this RPC?. Accessed only through the
+   * {@link #nextAttempt()}, {@link #getAttempt()} and {@link #resetAttempt()}
+   * accessors. An {@link AtomicInteger} provides the required atomicity and
+   * cross-thread visibility without acquiring a monitor on the retry-check
+   * paths (e.g. {@code getSleepTimeForRpcMillis}, {@code cannotRetryRequest}).
    */
-  int attempt;  // package-private for RpcProxy and AsyncKuduClient only.
+  private final AtomicInteger attempt = new AtomicInteger();
 
   /**
    * Set by RpcProxy when isRequestTracked returns true to identify this RPC in the sequence of
    * RPCs sent by this client. Once it is set it should never change unless the RPC is reused.
    */
-  private long sequenceId = RequestTracker.NO_SEQ_NO;
+  private volatile long sequenceId = RequestTracker.NO_SEQ_NO;
+
+  int nextAttempt() {
+    return attempt.incrementAndGet();
+  }
+
+  int getAttempt() {
+    return attempt.get();
+  }
+
+  private void resetAttempt() {
+    attempt.set(0);
+  }
 
   KuduRpc(KuduTable table, Timer timer, long timeoutMillis) {
     this.table = table;
@@ -261,7 +275,7 @@ public abstract class KuduRpc<R> {
       return;
     }
     deferred = null;
-    attempt = 0;
+    resetAttempt();
     // If the subclass is a "tracked RPC" unregister it, unless it never
     // got to the point of being registered.
     if (isRequestTracked() && sequenceId != RequestTracker.NO_SEQ_NO) {
@@ -396,7 +410,7 @@ public abstract class KuduRpc<R> {
     } else {
       buf.append(tablet.getTabletId());
     }
-    buf.append(", attempt=").append(attempt);
+    buf.append(", attempt=").append(getAttempt());
     if (isRequestTracked()) {
       buf.append(", sequence_id=").append(sequenceId);
     }

@@ -21,7 +21,7 @@
 
 This document gives the steps required to perform a Kudu release, and is a
 resource for Kudu release managers. Make sure to read and understand the
-link:http://www.apache.org/legal/release-policy.html[ASF policy on software
+link:https://www.apache.org/legal/release-policy.html[ASF policy on software
 releases] prior to conducting the release management activity. Pay attention to
 the link:https://www.apache.org/legal/resolved.html[3rd-party license policy],
 making sure the release doesn't include anything from the
@@ -156,10 +156,10 @@ Example doc: https://s.apache.org/kudu1.16rn
 . Before building a release candidate, make sure you have followed the
   Apache committer guide for
   link:https://www.apache.org/dev/new-committers-guide.html#set-up-security-and-pgp-keys[
-  setting up your PGP keys]. In addition to the link:http://pgp.mit.edu/[MIT
+  setting up your PGP keys]. In addition to the link:https://pgp.mit.edu/[MIT
   PGP public key server] referenced in the committer guide, consider adding
   your keys to one of link:http://pool.sks-keyservers.net:11371[SKS OpenPGP
-  keyservers] or link:http://keyserver.ubuntu.com:11371[Ubuntu OpenPGP
+  keyservers] or link:https://keyserver.ubuntu.com[Ubuntu OpenPGP
   keyserver]. The MIT keyserver sometimes is not available, and it takes some
   time to propagate key updates anyways: the latter two servers are used by the
   link:https://repository.apache.org[Apache Maven repo server] to verify the
@@ -222,6 +222,9 @@ Example doc: https://s.apache.org/kudu1.16rn
   `examples/java/insert-loadgen/pom.xml`, etc.).
   The idea is making all examples use the artifacts of the newly released
   `1.x.y` version of Kudu. Commit and send out the changes for review on Gerrit.
++
+NOTE: Don't forget to also update `KUDU_VERSION` and `KUDU_PYTHON_VERSION` in
+`examples/flink-replication/.env`.
 
 . When ready, create a new lightweight tag and push it to the Apache Git repository.
 +
@@ -372,7 +375,8 @@ in its summary tab
   # Prepare and sign the python source distribution.
   cd python
   rm -rf dist/*
-  python setup.py sdist
+  pip install build
+  python -m build --sdist
   gpg --detach-sign -a dist/kudu-python-1.x.y.tar.gz
   # Upload the distribution to PyPi using twine.
   pip install twine
@@ -459,7 +463,8 @@ link:https://issues.apache.org/jira/browse/INFRA-23166[INFRA-23166].
   information under the `examples` sub-directory to make all examples using the
   fresh artifacts of latest released version.  This should be done only after
   publishing the officially released artifacts, so they are available while
-  building the examples.
+  building the examples. Don't forget to also update `KUDU_VERSION` and
+  `KUDU_PYTHON_VERSION` in `examples/flink-replication/.env`.
 
 . In the `master` branch of the project git repo, add the previous release notes to the
   `prior_release_notes.adoc` and send out the change for review on Gerrit.

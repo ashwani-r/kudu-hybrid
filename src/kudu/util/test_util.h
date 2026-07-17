@@ -31,7 +31,6 @@
 
 #include <gtest/gtest.h>
 
-#include "kudu/gutil/port.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 
@@ -176,24 +175,24 @@ int CountOpenFds(Env* env, const std::string& path_pattern);
 // semantically mean the same.
 Status WaitForTcpBind(pid_t pid, uint16_t* port,
                       const std::vector<std::string>& addresses,
-                      MonoDelta timeout) WARN_UNUSED_RESULT;
+                      MonoDelta timeout);
 
 // Similar to above but binds to any listening UDP port.
 Status WaitForUdpBind(pid_t pid, uint16_t* port,
                       const std::vector<std::string>& addresses,
-                      MonoDelta timeout) WARN_UNUSED_RESULT;
+                      MonoDelta timeout);
 
 // Similar to WaitForTcpBind(), but when port is known beforehand
 // and the PID doesn't matter.
 Status WaitForTcpBindAtPort(const std::vector<std::string>& addresses,
                             uint16_t port,
-                            MonoDelta timeout) WARN_UNUSED_RESULT;
+                            MonoDelta timeout);
 
 // Similar to WaitForUdpBind(), but when port is known beforehand
 // and the PID doesn't matter.
 Status WaitForUdpBindAtPort(const std::vector<std::string>& addresses,
                             uint16_t port,
-                            MonoDelta timeout) WARN_UNUSED_RESULT;
+                            MonoDelta timeout);
 
 // Find the home directory of a Java-style application, e.g. JAVA_HOME or
 // HADOOP_HOME.
@@ -202,7 +201,7 @@ Status WaitForUdpBindAtPort(const std::vector<std::string>& addresses,
 // directory.
 Status FindHomeDir(const std::string& name,
                    const std::string& bin_dir,
-                   std::string* home_dir) WARN_UNUSED_RESULT;
+                   std::string* home_dir);
 
 // Contains the endpoints which are to be found on Master and TServer as well.
 // Key: endpoint name, value: content-type header for that particular endpoint.
@@ -221,6 +220,11 @@ const std::unordered_map<std::string, std::string>& GetMasterWebserverEndpoints(
 // Prometheus metrics output sanity check. This check is used in both the tablet_server-test
 // and the master-test, so it is placed here.
 void CheckPrometheusOutput(const std::string& prometheus_output);
+
+// Asserts that 'prometheus_output' contains no metric value lines (only comment/metadata
+// lines starting with '#' are allowed). Use after CheckPrometheusOutput() when the
+// expectation is that a filter produces an effectively empty result.
+void CheckNoPrometheusValueLines(const std::string& prometheus_output);
 
 // Beautifies test output if a test scenario fails.
 std::ostream& operator<<(std::ostream& os, const IPMode& mode);

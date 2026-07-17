@@ -477,15 +477,14 @@ void Messenger::ScheduleOnReactor(std::function<void(const Status&)> func,
     chosen = reactors_[rand() % reactors_.size()];
   }
 
-  DelayedTask* task = new DelayedTask(std::move(func), when);
-  chosen->ScheduleReactorTask(task);
+  chosen->ScheduleReactorTask(MakeDelayedTask(std::move(func), when));
 }
 
-const scoped_refptr<RpcService> Messenger::rpc_service(const string& service_name) const {
+scoped_refptr<RpcService> Messenger::rpc_service(const string& service_name) const {
   scoped_refptr<RpcService> service;
   {
     shared_lock guard(lock_.get_lock());
-    if (!FindCopy(rpc_services_, service_name, &service)) {
+    if (PREDICT_FALSE(!FindCopy(rpc_services_, service_name, &service))) {
       return scoped_refptr<RpcService>(nullptr);
     }
   }

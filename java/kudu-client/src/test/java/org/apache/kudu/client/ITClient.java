@@ -70,7 +70,7 @@ public class ITClient {
   private Exception failureException;
 
   private KuduTable table;
-  private long runtimeInSeconds;
+  private volatile long runtimeInSeconds;
 
   private volatile long sharedWriteTimestamp;
 
@@ -314,7 +314,7 @@ public class ITClient {
     private final Random random = RandomUtils.getRandom();
 
     // Updated by calling a full scan.
-    private int lastRowCount = 0;
+    private volatile int lastRowCount = 0;
 
     @Override
     public void run() {

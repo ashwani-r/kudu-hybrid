@@ -16,22 +16,30 @@
 // under the License.
 #include "kudu/master/auto_rebalancer.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <functional>
+#include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
-#include <gflags/gflags_declare.h>
-#include "kudu/util/scoped_cleanup.h"
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/client/client.h"
+#include "kudu/client/schema.h"
+#include "kudu/common/partial_row.h"
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/map-util.h"
@@ -48,25 +56,52 @@
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
 #include "kudu/mini-cluster/internal_mini_cluster.h"
-#include "kudu/tserver/mini_tablet_server.h"
+#include "kudu/rebalance/cluster_status.h"
+#include "kudu/rebalance/rebalance_algo.h"
+#include "kudu/rebalance/rebalancer.h"
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/util/logging_test_util.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
+#include "kudu/util/net/sockaddr.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 using kudu::cluster::InternalMiniCluster;
 using kudu::cluster::InternalMiniClusterOptions;
+using kudu::consensus::BulkChangeConfigRequestPB;
+using kudu::consensus::ChangeConfigResponsePB;
+using kudu::consensus::ConsensusStatePB;
 using kudu::consensus::EXCLUDE_HEALTH_REPORT;
 using kudu::consensus::GetConsensusStateRequestPB;
 using kudu::consensus::GetConsensusStateResponsePB;
+using kudu::consensus::MODIFY_PEER;
 using kudu::itest::GetTableLocations;
 using kudu::itest::ListTabletServers;
 using kudu::master::GetTableLocationsResponsePB;
+using kudu::client::KuduClient;
+using kudu::client::KuduColumnSchema;
+using kudu::client::KuduSchema;
+using kudu::client::KuduSchemaBuilder;
+using kudu::client::KuduTable;
+using kudu::client::KuduTableAlterer;
+using kudu::client::KuduTableCreator;
+using kudu::client::sp::shared_ptr;
+using kudu::KuduPartialRow;
 using kudu::rpc::RpcController;
+using google::FlagSaver;
+using std::map;
+using std::max;
+using std::make_unique;
+using std::min;
+using std::numeric_limits;
+using std::nullopt;
+using std::optional;
 using std::set;
 using std::string;
 using std::unique_ptr;
@@ -76,8 +111,12 @@ using std::vector;
 using strings::Substitute;
 
 DECLARE_bool(auto_leader_rebalancing_enabled);
+DECLARE_bool(auto_rebalancing_prefer_follower_replica_moves);
 DECLARE_bool(auto_rebalancing_enabled);
+DECLARE_bool(auto_rebalancing_enable_range_rebalancing);
 DECLARE_bool(auto_rebalancing_fail_moves_for_test);
+DECLARE_bool(enable_range_replica_placement);
+DECLARE_bool(enable_minidumps);
 DECLARE_int32(consensus_inject_latency_ms_in_notifications);
 DECLARE_int32(follower_unavailable_considered_failed_sec);
 DECLARE_int32(raft_heartbeat_interval_ms);
@@ -91,6 +130,9 @@ DECLARE_uint32(auto_rebalancing_wait_for_replica_moves_seconds);
 METRIC_DECLARE_gauge_int32(tablet_copy_open_client_sessions);
 METRIC_DECLARE_counter(tablet_copy_bytes_fetched);
 METRIC_DECLARE_counter(tablet_copy_bytes_sent);
+METRIC_DECLARE_counter(auto_rebalancer_leader_moves_scheduled);
+METRIC_DECLARE_counter(auto_rebalancer_follower_moves_scheduled);
+METRIC_DECLARE_counter(auto_rebalancer_rounds_completed);
 
 namespace {
 
@@ -227,6 +269,100 @@ class AutoRebalancerTest : public KuduTest {
     });
   }
 
+  static Status BuildClusterRawInfoForTest(
+      AutoRebalancerTask* auto_rebalancer,
+      const optional<string>& location,
+      rebalance::ClusterRawInfo* raw_info) {
+    return auto_rebalancer->BuildClusterRawInfo(location, raw_info);
+  }
+
+  static Status CheckMoveCompletedForTest(
+      AutoRebalancerTask* auto_rebalancer,
+      const rebalance::Rebalancer::ReplicaMove& move,
+      bool* is_complete) {
+    return auto_rebalancer->CheckMoveCompleted(move, is_complete);
+  }
+
+  static void ExecuteMovesForTest(
+      AutoRebalancerTask* auto_rebalancer,
+      vector<rebalance::Rebalancer::ReplicaMove>* moves) {
+    auto_rebalancer->ExecuteMoves(moves);
+  }
+
+  // Builds a thread-less AutoRebalancerTask wired to the same cluster as the
+  // live one. moves_per_tserver_ is only ever touched by the single live
+  // auto-rebalancer thread in production, so it carries no lock; driving
+  // ExecuteMoves() from the test thread against the live task would race that
+  // thread. The standalone task owns its own state and never starts a loop
+  // (Init() is not called), but reuses 'messenger_source's messenger so it can
+  // still issue the change-config RPCs that ExecuteMoves() needs.
+  static std::unique_ptr<AutoRebalancerTask> MakeStandaloneRebalancerForTest(
+      CatalogManager* catalog_manager,
+      TSManager* ts_manager,
+      const scoped_refptr<MetricEntity>& metric_entity,
+      AutoRebalancerTask* messenger_source) {
+    std::unique_ptr<AutoRebalancerTask> task(
+        new AutoRebalancerTask(catalog_manager, ts_manager, metric_entity));
+    task->messenger_ = messenger_source->messenger_;
+    return task;
+  }
+
+  static Status GetTabletLeaderForTest(
+      AutoRebalancerTask* auto_rebalancer,
+      const string& tablet_id,
+      string* leader_uuid,
+      HostPort* leader_hp) {
+    return auto_rebalancer->GetTabletLeader(tablet_id, leader_uuid, leader_hp);
+  }
+
+  static int MovesPerTserver(AutoRebalancerTask* auto_rebalancer,
+                             const string& ts_uuid) {
+    return auto_rebalancer->moves_per_tserver_[ts_uuid];
+  }
+
+  static Status BuildClusterInfoForTest(
+      AutoRebalancerTask* auto_rebalancer,
+      const rebalance::ClusterRawInfo& raw_info,
+      rebalance::ClusterInfo* cluster_info,
+      const rebalance::Rebalancer::MovesInProgress& moves_in_progress = {}) {
+    return auto_rebalancer->rebalancer_.BuildClusterInfo(
+        raw_info, moves_in_progress, cluster_info);
+  }
+
+  static map<string, int> ComputeRangeReplicaSkew(
+      const rebalance::ClusterRawInfo& raw_info,
+      const string& table_id) {
+    vector<string> tserver_uuids;
+    tserver_uuids.reserve(raw_info.tserver_summaries.size());
+    for (const auto& ts : raw_info.tserver_summaries) {
+      tserver_uuids.emplace_back(ts.uuid);
+    }
+
+    unordered_map<string, unordered_map<string, int>> counts_by_tag;
+    for (const auto& tablet : raw_info.tablet_summaries) {
+      if (tablet.table_id != table_id) {
+        continue;
+      }
+      auto& counts_by_ts = counts_by_tag[tablet.range_key_begin];
+      for (const auto& replica : tablet.replicas) {
+        counts_by_ts[replica.ts_uuid]++;
+      }
+    }
+
+    map<string, int> skew_by_tag;
+    for (const auto& [tag, counts_by_ts] : counts_by_tag) {
+      int min_count = numeric_limits<int>::max();
+      int max_count = numeric_limits<int>::min();
+      for (const auto& ts_uuid : tserver_uuids) {
+        const int count = FindWithDefault(counts_by_ts, ts_uuid, 0);
+        min_count = min(min_count, count);
+        max_count = max(max_count, count);
+      }
+      skew_by_tag.emplace(tag, max_count - min_count);
+    }
+    return skew_by_tag;
+  }
+
   // Maps from tserver UUID to the bytes sent and fetched by each tserver as a
   // part of tablet copying.
   typedef unordered_map<string, int> MetricByUuid;
@@ -270,6 +406,22 @@ class AutoRebalancerTest : public KuduTest {
         auto_leader_rebalancer()->number_of_loop_iterations_for_test_;
   }
 
+  int NumMovesAttempted(int master_idx) {
+    DCHECK(cluster_ != nullptr);
+    return cluster_->mini_master(master_idx)->master()->catalog_manager()->
+        auto_rebalancer()->moves_attempted_this_round_for_test_;
+  }
+
+  int64_t GetMasterCounterValue(CounterPrototype* prototype) const {
+    int leader_idx;
+    CHECK_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+    // Instantiate() is idempotent: it returns the existing counter instance
+    // when the metric has already been registered by the AutoRebalancerTask
+    // constructor, so this does not create a fresh zeroed counter.
+    return prototype->Instantiate(
+        cluster_->mini_master(leader_idx)->master()->metric_entity())->value();
+  }
+
   int NumMovesScheduled(int master_idx,
                         BalanceThreadType type = BalanceThreadType::REPLICA_REBALANCE) {
     DCHECK(cluster_ != nullptr);
@@ -292,6 +444,8 @@ class AutoRebalancerTest : public KuduTest {
     if (cluster_) {
       cluster_->Shutdown();
     }
+    // Restore any flags after the cluster is fully shut down.
+    flag_saver_.reset();
     KuduTest::TearDown();
   }
 
@@ -299,6 +453,7 @@ class AutoRebalancerTest : public KuduTest {
     unique_ptr<InternalMiniCluster> cluster_;
     InternalMiniClusterOptions cluster_opts_;
     unique_ptr<TestWorkload> workload_;
+    unique_ptr<FlagSaver> flag_saver_;
   };
 
 // Make sure that only the leader master is doing auto-rebalancing
@@ -453,6 +608,206 @@ TEST_F(AutoRebalancerTest, NoReplicaMovesIfNoTablets) {
   ASSERT_OK(CreateAndStartCluster());
   NO_FATALS(CheckAutoRebalancerStarted());
   NO_FATALS(CheckNoMovesScheduled());
+}
+
+// Verify that range-aware mode groups balance info by range start key, while
+// non-range-aware mode collapses all ranges into a single tag.
+TEST_F(AutoRebalancerTest, RangeAwareBuildClusterInfoGroupsByRange) {
+  flag_saver_ = make_unique<FlagSaver>();
+  FLAGS_auto_rebalancing_enable_range_rebalancing = true;
+  // Avoid minidump handler thread teardown races in mini-cluster shutdown.
+  FLAGS_enable_minidumps = false;
+
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster());
+  NO_FATALS(CheckAutoRebalancerStarted());
+
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+
+  const string kTableName = "range_aware_auto_rebalancer_test";
+  KuduSchema schema;
+  KuduSchemaBuilder builder;
+  builder.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull();
+  builder.SetPrimaryKey({ "key" });
+  ASSERT_OK(builder.Build(&schema));
+
+  unique_ptr<KuduPartialRow> lower0(schema.NewRow());
+  unique_ptr<KuduPartialRow> upper0(schema.NewRow());
+  ASSERT_OK(lower0->SetInt32("key", 0));
+  ASSERT_OK(upper0->SetInt32("key", 10));
+  unique_ptr<KuduPartialRow> lower1(schema.NewRow());
+  unique_ptr<KuduPartialRow> upper1(schema.NewRow());
+  ASSERT_OK(lower1->SetInt32("key", 10));
+  ASSERT_OK(upper1->SetInt32("key", 20));
+
+  // Create a table with two explicit ranges and hash-partition each range
+  // into two buckets, so we get tablets in two distinct range groups.
+  unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
+  ASSERT_OK(table_creator->table_name(kTableName)
+                .schema(&schema)
+                .add_hash_partitions({ "key" }, 2)
+                .set_range_partition_columns({ "key" })
+                .add_range_partition(lower0.release(), upper0.release())
+                .add_range_partition(lower1.release(), upper1.release())
+                .num_replicas(3)
+                .Create());
+
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client->OpenTable(kTableName, &table));
+  const auto& table_id = table->id();
+
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  auto* auto_rebalancer =
+      cluster_->mini_master(leader_idx)->master()->catalog_manager()->auto_rebalancer();
+
+  rebalance::ClusterRawInfo raw_info;
+  ASSERT_OK(BuildClusterRawInfoForTest(auto_rebalancer, nullopt, &raw_info));
+
+  // Raw tablet summaries should carry non-empty range tags in range-aware mode.
+  unordered_set<string> range_tags;
+  for (const auto& tablet : raw_info.tablet_summaries) {
+    if (tablet.table_id != table_id) {
+      continue;
+    }
+    ASSERT_FALSE(tablet.range_key_begin.empty());
+    range_tags.insert(tablet.range_key_begin);
+  }
+  ASSERT_EQ(2, range_tags.size());
+
+  // Balance info should now be grouped by table_id + range tag.
+  rebalance::ClusterInfo cluster_info;
+  ASSERT_OK(BuildClusterInfoForTest(auto_rebalancer, raw_info, &cluster_info));
+  unordered_set<string> tags_in_balance;
+  for (const auto& elem : cluster_info.balance.table_info_by_skew) {
+    const auto& tbi = elem.second;
+    if (tbi.table_id == table_id) {
+      tags_in_balance.insert(tbi.tag);
+    }
+  }
+  ASSERT_EQ(range_tags, tags_in_balance);
+
+  // With range-aware mode disabled, range tags should be empty.
+  FLAGS_auto_rebalancing_enable_range_rebalancing = false;
+  rebalance::ClusterRawInfo raw_info_no_range;
+  ASSERT_OK(BuildClusterRawInfoForTest(auto_rebalancer, nullopt, &raw_info_no_range));
+  int tablet_count = 0;
+  for (const auto& tablet : raw_info_no_range.tablet_summaries) {
+    if (tablet.table_id != table_id) {
+      continue;
+    }
+    ++tablet_count;
+    ASSERT_TRUE(tablet.range_key_begin.empty());
+  }
+  ASSERT_GT(tablet_count, 0);
+
+  // Balance info should collapse to a single empty tag.
+  rebalance::ClusterInfo cluster_info_no_range;
+  rebalance::Rebalancer local_rebalancer(rebalance::Rebalancer::Config{});
+  ASSERT_OK(local_rebalancer.BuildClusterInfo(
+      raw_info_no_range, rebalance::Rebalancer::MovesInProgress(), &cluster_info_no_range));
+  unordered_set<string> tags_no_range;
+  for (const auto& elem : cluster_info_no_range.balance.table_info_by_skew) {
+    const auto& tbi = elem.second;
+    if (tbi.table_id == table_id) {
+      tags_no_range.insert(tbi.tag);
+    }
+  }
+  ASSERT_EQ(1, tags_no_range.size());
+  ASSERT_TRUE(ContainsKey(tags_no_range, ""));
+}
+
+TEST_F(AutoRebalancerTest, RangeAwareRebalancesNewRangeReplicas) {
+  flag_saver_ = make_unique<FlagSaver>();
+  FLAGS_auto_rebalancing_enable_range_rebalancing = true;
+  FLAGS_auto_rebalancing_enabled = false;
+  FLAGS_enable_range_replica_placement = false;
+  // Avoid minidump handler thread teardown races in mini-cluster shutdown.
+  FLAGS_enable_minidumps = false;
+
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster());
+  NO_FATALS(CheckAutoRebalancerStarted());
+
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+
+  const string kTableName = "range_aware_rebalance_new_range";
+  KuduSchema schema;
+  KuduSchemaBuilder builder;
+  builder.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull();
+  builder.SetPrimaryKey({ "key" });
+  ASSERT_OK(builder.Build(&schema));
+
+  unique_ptr<KuduPartialRow> lower0(schema.NewRow());
+  unique_ptr<KuduPartialRow> upper0(schema.NewRow());
+  ASSERT_OK(lower0->SetInt32("key", 0));
+  ASSERT_OK(upper0->SetInt32("key", 10));
+
+  unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
+  ASSERT_OK(table_creator->table_name(kTableName)
+                .schema(&schema)
+                .add_hash_partitions({ "key" }, 8)
+                .set_range_partition_columns({ "key" })
+                .add_range_partition(lower0.release(), upper0.release())
+                .num_replicas(3)
+                .Create());
+
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client->OpenTable(kTableName, &table));
+  const auto& table_id = table->id();
+
+  // Add a new tserver with no replicas yet.
+  ASSERT_OK(cluster_->AddTabletServer());
+
+  // Add a second range after the empty tserver joins.
+  unique_ptr<KuduPartialRow> lower1(schema.NewRow());
+  unique_ptr<KuduPartialRow> upper1(schema.NewRow());
+  ASSERT_OK(lower1->SetInt32("key", 10));
+  ASSERT_OK(upper1->SetInt32("key", 20));
+  unique_ptr<KuduTableAlterer> alterer(
+      client->NewTableAlterer(kTableName));
+  ASSERT_OK(alterer->AddRangePartition(lower1.release(), upper1.release())
+                ->Alter());
+
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  auto* auto_rebalancer =
+      cluster_->mini_master(leader_idx)->master()->catalog_manager()->auto_rebalancer();
+
+  // Wait until both ranges are present and replicas are placed.
+  rebalance::ClusterRawInfo raw_info;
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(BuildClusterRawInfoForTest(auto_rebalancer, nullopt, &raw_info));
+    int tablet_count = 0;
+    unordered_set<string> tags;
+    for (const auto& tablet : raw_info.tablet_summaries) {
+      if (tablet.table_id != table_id) {
+        continue;
+      }
+      ++tablet_count;
+      ASSERT_FALSE(tablet.range_key_begin.empty());
+      tags.insert(tablet.range_key_begin);
+    }
+    ASSERT_EQ(16, tablet_count);
+    ASSERT_EQ(2, tags.size());
+  });
+
+  // Capture skew before rebalancing; it may or may not be imbalanced depending
+  // on placement randomness, so we don't assert on it.
+  const auto skew_by_tag = ComputeRangeReplicaSkew(raw_info, table_id);
+
+  // Enable the auto-rebalancer and wait for skew <= 1 for each range.
+  FLAGS_auto_rebalancing_enabled = true;
+  ASSERT_EVENTUALLY([&] {
+    rebalance::ClusterRawInfo raw_info_after;
+    ASSERT_OK(BuildClusterRawInfoForTest(auto_rebalancer, nullopt, &raw_info_after));
+    const auto skew_after = ComputeRangeReplicaSkew(raw_info_after, table_id);
+    for (const auto& elem : skew_after) {
+      ASSERT_LE(elem.second, 1) << "range tag: " << elem.first;
+    }
+  });
 }
 
 // Assign each tserver to its own location.
@@ -689,8 +1044,10 @@ TEST_F(AutoRebalancerTest, NoRebalancingIfReplicasRecovering) {
   NO_FATALS(CheckNoMovesScheduled());
 }
 
-// Make sure the auto-rebalancer reports the failure of scheduled replica movements,
-// in the case that tablet server failure is not yet accounted for by the TSManager.
+// Make sure the auto-rebalancer handles the case where scheduling RPCs fail
+// because tserver failure is not yet accounted for by the TSManager.
+// Failed-to-schedule moves must be removed from replica_moves so
+// CheckReplicaMovesCompleted doesn't wait on them indefinitely.
 TEST_F(AutoRebalancerTest, TestHandlingFailedTservers) {
   // Set a high timeout for an unresponsive tserver to be presumed dead,
   // so the TSManager believes it is still available.
@@ -711,23 +1068,37 @@ TEST_F(AutoRebalancerTest, TestHandlingFailedTservers) {
     NO_FATALS(cluster_->mini_tablet_server(i)->Shutdown());
   }
 
-  // Capture the glog output to ensure failed replica movements occur
-  // and the warnings are logged.
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  const auto initial_loops = NumLoopIterations(leader_idx);
+
+  // Capture glog output to verify per-move scheduling failures are logged.
   StringVectorSink pre_capture_logs;
   {
     ScopedRegisterSink reg(&pre_capture_logs);
     // Bring up a new tserver.
     ASSERT_OK(cluster_->AddTabletServer());
 
-    // The TSManager should still believe the original tservers are available,
-    // so the auto-rebalancer should attempt to schedule replica moves from those
-    // tservers to the new one.
-    NO_FATALS(CheckSomeMovesScheduled());
+    // The TSManager still believes the original tservers are available, so
+    // GetMoves will find moves to schedule. All scheduling RPCs will fail
+    // because the original tservers are unreachable. The three assertions
+    // are evaluated atomically within one ASSERT_EVENTUALLY iteration to
+    // verify the fix without vacuous passes:
+    // 1. The loop is not blocked (at least two more iterations ran).
+    // 2. GetMoves found moves to attempt this round (attempted > 0), proving
+    //    the cluster was imbalanced and work was dispatched to ExecuteMoves.
+    // 3. After ExecuteMoves, zero moves remain (scheduled == 0), proving
+    //    that the failed moves were removed rather than left pending.
+    ASSERT_EVENTUALLY([&] {
+      ASSERT_LT(initial_loops + 1, NumLoopIterations(leader_idx));
+      ASSERT_GT(NumMovesAttempted(leader_idx), 0);
+      ASSERT_EQ(0, NumMovesScheduled(leader_idx));
+    });
   }
   {
     SCOPED_TRACE(JoinStrings(pre_capture_logs.logged_msgs(), "\n"));
     ASSERT_STRINGS_ANY_MATCH(pre_capture_logs.logged_msgs(),
-        "scheduled replica move failed to complete|failed to send replica move request");
+        "Failed to schedule move for tablet");
   }
 
   // Wait for the TSManager to realize that the original tservers are unavailable.
@@ -790,7 +1161,7 @@ TEST_F(AutoRebalancerTest, TestDeletedTables) {
   GetTableLocationsResponsePB table_locs;
   ASSERT_OK(GetTableLocations(cluster_->master_proxy(), kNewTableName,
                               MonoDelta::FromSeconds(10), ReplicaTypeFilter::ANY_REPLICA,
-                              /*table_id*/std::nullopt, &table_locs));
+                              /*table_id*/nullopt, &table_locs));
   unordered_set<string> deleted_tablet_ids;
   for (const auto& t : table_locs.tablet_locations()) {
     EmplaceIfNotPresent(&deleted_tablet_ids, t.tablet_id());
@@ -864,27 +1235,507 @@ TEST_F(AutoRebalancerTest, TestRemoveReplaceFlagIfMoveFails) {
   // Stop the auto rebalancing after current loop.
   FLAGS_auto_rebalancing_enabled = false;
 
-  // Check all the replace markers are false.
-  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
-    const auto& tserver = cluster_->mini_tablet_server(i);
-    const auto& tablet_ids = tserver->ListTablets();
-    for (const auto& tablet_id: tablet_ids) {
-      GetConsensusStateRequestPB req;
-      GetConsensusStateResponsePB resp;
-      RpcController controller;
-      controller.set_timeout(MonoDelta::FromSeconds(60));
-      req.set_dest_uuid(tserver->uuid());
-      req.add_tablet_ids(tablet_id);
-      req.set_report_health(EXCLUDE_HEALTH_REPORT);
-      ASSERT_OK(cluster_->tserver_consensus_proxy(i)->GetConsensusState(req, &resp, &controller));
+  // Check all the replace markers are false. Give extra time for TSAN builds
+  // which are significantly slower. The GetConsensusState RPC loop is expensive.
+  const auto kTimeout = MonoDelta::FromSeconds(
+#ifdef THREAD_SANITIZER
+      180  // TSAN is ~5-10x slower
+#else
+      60
+#endif
+  );
 
-      const auto& committed_config = resp.tablets(0).cstate().committed_config();
-      for (int p = 0; p < committed_config.peers_size(); p++) {
-        const auto& peer = committed_config.peers(p);
-        ASSERT_FALSE(peer.attrs().replace());
+  AssertEventually([&] {
+    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+      const auto& tserver = cluster_->mini_tablet_server(i);
+      const auto& tablet_ids = tserver->ListTablets();
+      for (const auto& tablet_id : tablet_ids) {
+        GetConsensusStateRequestPB req;
+        GetConsensusStateResponsePB resp;
+        RpcController controller;
+        controller.set_timeout(MonoDelta::FromSeconds(5));
+        req.set_dest_uuid(tserver->uuid());
+        req.add_tablet_ids(tablet_id);
+        req.set_report_health(EXCLUDE_HEALTH_REPORT);
+        ASSERT_OK(cluster_->tserver_consensus_proxy(i)->GetConsensusState(
+            req, &resp, &controller));
+
+        // The tserver may no longer be hosting this tablet by the time the
+        // RPC is served (e.g. it was evicted and the replica was deleted
+        // between ListTablets() and now). Skip rather than indexing into an
+        // empty repeated field.
+        if (resp.tablets_size() == 0) continue;
+        const auto& cstate = resp.tablets(0).cstate();
+
+        // Only assert on the leader's view. Followers, and especially a freshly
+        // added NON_VOTER on a new tserver that joined just before being
+        // evicted, can hold a stale committed_config that never saw the
+        // master's cleanup MODIFY_PEER op clear the marker.
+        if (cstate.leader_uuid() != tserver->uuid()) continue;
+
+        const auto& committed_config = cstate.committed_config();
+        for (int p = 0; p < committed_config.peers_size(); p++) {
+          const auto& peer = committed_config.peers(p);
+          ASSERT_FALSE(peer.attrs().replace())
+              << "ts_idx=" << i
+              << " ts_uuid=" << tserver->uuid()
+              << " tablet_id=" << tablet_id
+              << " peer_uuid=" << peer.permanent_uuid()
+              << " peer_member_type="
+              << consensus::RaftPeerPB::MemberType_Name(peer.member_type())
+              << " committed_opid_index=" << committed_config.opid_index()
+              << " current_term=" << cstate.current_term();
+        }
       }
     }
+  }, kTimeout);
+  NO_PENDING_FATALS();
+}
+
+// Rebalancer::BuildClusterInfo() fills ClusterInfo::ts_with_followers_by_table_and_tag
+// from non-leader replicas in the ksck-derived view. Exercise the same path as
+// production via BuildClusterRawInfoForTest + BuildClusterInfoForTest on a live
+// cluster with RF>1 data.
+TEST_F(AutoRebalancerTest, BuildClusterInfoPopulatesFollowersByTableAndTag) {
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+  NO_FATALS(CheckAutoRebalancerStarted());
+
+  CreateWorkloadTable(/*num_tablets*/6, /*num_replicas*/3);
+  workload_->Start();
+  while (workload_->rows_inserted() < 500) {
+    SleepFor(MonoDelta::FromMilliseconds(100));
   }
+  workload_->StopAndJoin();
+
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  auto* auto_rebalancer =
+      cluster_->mini_master(leader_idx)->master()->catalog_manager()->auto_rebalancer();
+
+  rebalance::ClusterRawInfo raw_info;
+  rebalance::ClusterInfo cluster_info;
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(BuildClusterRawInfoForTest(auto_rebalancer, nullopt, &raw_info));
+    ASSERT_OK(BuildClusterInfoForTest(auto_rebalancer, raw_info, &cluster_info));
+    ASSERT_FALSE(cluster_info.ts_with_followers_by_table_and_tag.empty())
+        << "expected at least one {table,tag} with non-leader replicas";
+  });
+  for (const auto& elem : cluster_info.ts_with_followers_by_table_and_tag) {
+    ASSERT_FALSE(elem.second.empty());
+  }
+}
+
+// A replica listed as the source of an in-progress move is not counted in
+// BuildClusterInfo(), so it must not appear in ts_with_followers_by_table_and_tag
+// for that {table_id, tag}. Use a single tablet (RF=3) so the moving follower
+// is the table's only replica on that server, making the effect visible.
+TEST_F(AutoRebalancerTest, BuildClusterInfoExcludesMovingFollowerSourceFromFollowerMap) {
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+  NO_FATALS(CheckAutoRebalancerStarted());
+
+  CreateWorkloadTable(/*num_tablets*/1, /*num_replicas*/3);
+  workload_->Start();
+  while (workload_->rows_inserted() < 500) {
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  }
+  workload_->StopAndJoin();
+
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  auto* auto_rebalancer =
+      cluster_->mini_master(leader_idx)->master()->catalog_manager()->auto_rebalancer();
+
+  rebalance::ClusterRawInfo raw_info;
+  string tablet_id;
+  string follower_ts_uuid;
+  rebalance::TableIdAndTag table_and_tag;
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(BuildClusterRawInfoForTest(auto_rebalancer, nullopt, &raw_info));
+    bool found = false;
+    for (const auto& tablet : raw_info.tablet_summaries) {
+      if (tablet.result != kudu::cluster_summary::HealthCheckResult::HEALTHY) {
+        continue;
+      }
+      for (const auto& replica : tablet.replicas) {
+        if (replica.is_leader || !replica.ts_healthy) {
+          continue;
+        }
+        tablet_id = tablet.id;
+        follower_ts_uuid = replica.ts_uuid;
+        table_and_tag.table_id = tablet.table_id;
+        table_and_tag.tag = FLAGS_auto_rebalancing_enable_range_rebalancing
+            ? tablet.range_key_begin : "";
+        found = true;
+        break;
+      }
+      if (found) {
+        break;
+      }
+    }
+    ASSERT_TRUE(found);
+  });
+
+  rebalance::ClusterInfo baseline;
+  ASSERT_OK(BuildClusterInfoForTest(auto_rebalancer, raw_info, &baseline));
+  const auto* baseline_followers = FindOrNull(
+      baseline.ts_with_followers_by_table_and_tag, table_and_tag);
+  ASSERT_TRUE(baseline_followers != nullptr);
+  ASSERT_TRUE(ContainsKey(*baseline_followers, follower_ts_uuid));
+
+  rebalance::Rebalancer::MovesInProgress moves_in_progress;
+  moves_in_progress.emplace(
+      tablet_id,
+      rebalance::Rebalancer::ReplicaMove{ tablet_id, follower_ts_uuid, "" });
+
+  rebalance::ClusterInfo with_move;
+  ASSERT_OK(BuildClusterInfoForTest(
+      auto_rebalancer, raw_info, &with_move, moves_in_progress));
+  const auto* followers_after = FindOrNull(
+      with_move.ts_with_followers_by_table_and_tag, table_and_tag);
+  ASSERT_TRUE(followers_after != nullptr);
+  ASSERT_FALSE(ContainsKey(*followers_after, follower_ts_uuid));
+}
+
+// Parameterized fixture for testing --auto_rebalancing_prefer_follower_replica_moves
+// with both true and false. Replica moves must be scheduled in both cases;
+// the flag only affects follower-vs-leader preference among equal candidates.
+class PreferFollowerRebalancingTest :
+    public AutoRebalancerTest,
+    public ::testing::WithParamInterface<bool> {
+};
+INSTANTIATE_TEST_SUITE_P(, PreferFollowerRebalancingTest, ::testing::Bool());
+
+TEST_P(PreferFollowerRebalancingTest, SchedulesReplicaMoves) {
+  flag_saver_ = make_unique<FlagSaver>();
+  FLAGS_auto_rebalancing_prefer_follower_replica_moves = GetParam();
+
+  constexpr int kNumOrigTservers = 3;
+  constexpr int kNumTablets = 6;
+
+  cluster_opts_.num_tablet_servers = kNumOrigTservers;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+  NO_FATALS(CheckAutoRebalancerStarted());
+
+  CreateWorkloadTable(kNumTablets, /*num_replicas*/3);
+  workload_->Start();
+  while (workload_->rows_inserted() < 500) {
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  }
+  workload_->StopAndJoin();
+
+  ASSERT_OK(cluster_->AddTabletServer());
+  NO_FATALS(CheckSomeMovesScheduled());
+}
+
+// Mixed RF scenario: one RF=1 table (no followers) and one RF=3 table (has
+// followers). The rebalancer must handle both simultaneously without crashing
+// and still schedule moves.
+TEST_F(AutoRebalancerTest, TestReplicaRebalancingMixedRFNoCrash) {
+  flag_saver_ = make_unique<FlagSaver>();
+  FLAGS_auto_rebalancing_prefer_follower_replica_moves = true;
+
+  constexpr int kNumOrigTservers = 3;
+  constexpr int kNumTablets = 6;
+
+  cluster_opts_.num_tablet_servers = kNumOrigTservers;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+  NO_FATALS(CheckAutoRebalancerStarted());
+
+  // RF=1 table: all replicas are leaders, follower map will be empty for it.
+  CreateWorkloadTable(kNumTablets, /*num_replicas*/1);
+  workload_->Start();
+  while (workload_->rows_inserted() < 500) {
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  }
+  workload_->StopAndJoin();
+
+  // RF=3 table: use a distinct name so Setup() creates a second table rather
+  // than reopening the already-existing RF=1 table (TestWorkload default name
+  // is "test-workload" for both, so an explicit name is required here).
+  workload_.reset(new TestWorkload(cluster_.get()));
+  workload_->set_num_tablets(kNumTablets);
+  workload_->set_num_replicas(3);
+  workload_->set_table_name("test-workload-rf3");
+  workload_->Setup();
+  workload_->Start();
+  while (workload_->rows_inserted() < 500) {
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  }
+  workload_->StopAndJoin();
+
+  ASSERT_OK(cluster_->AddTabletServer());
+  NO_FATALS(CheckSomeMovesScheduled());
+}
+
+// Verify that CheckMoveCompleted returns is_complete=false (waits) when
+// CatalogManager's opid_index has not yet advanced past the value recorded
+// at scheduling time, i.e. the heartbeat carrying the new config hasn't
+// arrived yet.
+TEST_F(AutoRebalancerTest, CheckMoveCompletedWaitsWhileCatalogIsStale) {
+  flag_saver_ = make_unique<FlagSaver>();
+  FLAGS_auto_rebalancing_enabled = false;
+
+  cluster_opts_.num_tablet_servers = 3;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+
+  CreateWorkloadTable(/*num_tablets*/1, /*num_replicas*/3);
+
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  auto* catalog = cluster_->mini_master(leader_idx)->master()->catalog_manager();
+  auto* auto_rebalancer = catalog->auto_rebalancer();
+
+  // Pick any tablet from the cluster.
+  rebalance::ClusterRawInfo raw_info;
+  string tablet_id;
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(BuildClusterRawInfoForTest(auto_rebalancer, nullopt, &raw_info));
+    ASSERT_FALSE(raw_info.tablet_summaries.empty());
+    tablet_id = raw_info.tablet_summaries[0].id;
+  });
+
+  // Read the current opid_index from CatalogManager.
+  consensus::ConsensusStatePB cstate;
+  {
+    CatalogManager::ScopedLeaderSharedLock l(catalog);
+    ASSERT_OK(l.first_failed_status());
+    ASSERT_OK(catalog->GetTabletConsensusState(tablet_id, &cstate));
+  }
+  const int64_t current_opid_index = cstate.committed_config().opid_index();
+
+  // Construct a move whose config_opid_idx equals the current catalog index,
+  // simulating the state immediately after BulkChangeConfig was sent but
+  // before the master receives the heartbeat for the new config.
+  rebalance::Rebalancer::ReplicaMove move;
+  move.tablet_uuid = tablet_id;
+  move.ts_uuid_from = raw_info.tablet_summaries[0].replicas[0].ts_uuid;
+  // A fake destination is fine here: CheckMoveCompleted returns early at the
+  // opid_index freshness gate (before inspecting the destination UUID) because
+  // no BulkChangeConfig is sent in this test, so the opid_index never advances.
+  move.ts_uuid_to = "fake-destination-uuid";
+  move.config_opid_idx = current_opid_index;
+
+  bool is_complete = true;
+  ASSERT_OK(CheckMoveCompletedForTest(auto_rebalancer, move, &is_complete));
+  ASSERT_FALSE(is_complete) << "expected CheckMoveCompleted to wait while "
+                               "catalog opid_index has not advanced";
+}
+
+// Verify that a CAS rejection from BulkChangeConfig (caused by a concurrent
+// config change advancing the opid_index before ExecuteMoves sends its
+// request) is handled gracefully: the move is dropped as a scheduling
+// failure, per-tserver counters are not incremented, and the rebalancer
+// does not crash.
+TEST_F(AutoRebalancerTest, ExecuteMovesCASRejectionDropsMoveGracefully) {
+  flag_saver_ = make_unique<FlagSaver>();
+  FLAGS_auto_rebalancing_enabled = false;
+
+  cluster_opts_.num_tablet_servers = 4;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+
+  CreateWorkloadTable(/*num_tablets*/1, /*num_replicas*/3);
+
+  int leader_idx;
+  ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
+  auto* catalog = cluster_->mini_master(leader_idx)->master()->catalog_manager();
+  auto* auto_rebalancer = catalog->auto_rebalancer();
+
+  // Drive ExecuteMoves() and inspect the move counters on a thread-less task to
+  // avoid racing the live auto-rebalancer thread on moves_per_tserver_.
+  auto standalone = MakeStandaloneRebalancerForTest(
+      catalog, cluster_->mini_master(leader_idx)->master()->ts_manager(),
+      cluster_->mini_master(leader_idx)->master()->metric_entity(),
+      auto_rebalancer);
+  auto* rebalancer = standalone.get();
+
+  // Wait for the cluster to stabilize and find a tablet with a known leader.
+  rebalance::ClusterRawInfo raw_info;
+  string tablet_id;
+  string src_ts_uuid;
+  string dst_ts_uuid;
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(BuildClusterRawInfoForTest(rebalancer, nullopt, &raw_info));
+    ASSERT_FALSE(raw_info.tablet_summaries.empty());
+    const auto& tablet = raw_info.tablet_summaries[0];
+    ASSERT_EQ(kudu::cluster_summary::HealthCheckResult::HEALTHY, tablet.result);
+    tablet_id = tablet.id;
+    // Pick the non-leader replica as the source.
+    for (const auto& r : tablet.replicas) {
+      if (!r.is_leader) {
+        src_ts_uuid = r.ts_uuid;
+        break;
+      }
+    }
+    ASSERT_FALSE(src_ts_uuid.empty());
+    // Find a tserver that holds no replica of this tablet to use as destination.
+    // With RF=3 and 4 tservers, exactly one tserver has no replica; we can't
+    // assume it's always index 3 since placement is non-deterministic.
+    unordered_set<string> replica_ts_uuids;
+    for (const auto& r : tablet.replicas) {
+      replica_ts_uuids.insert(r.ts_uuid);
+    }
+    dst_ts_uuid.clear();
+    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+      const string& ts_uuid = cluster_->mini_tablet_server(i)->uuid();
+      if (!ContainsKey(replica_ts_uuids, ts_uuid)) {
+        dst_ts_uuid = ts_uuid;
+        break;
+      }
+    }
+    ASSERT_FALSE(dst_ts_uuid.empty());
+  });
+
+  // Read the current opid_index from CatalogManager.
+  consensus::ConsensusStatePB cstate;
+  {
+    CatalogManager::ScopedLeaderSharedLock l(catalog);
+    ASSERT_OK(l.first_failed_status());
+    ASSERT_OK(catalog->GetTabletConsensusState(tablet_id, &cstate));
+  }
+  const int64_t pre_opid_index = cstate.committed_config().opid_index();
+
+  // Advance the leader's committed config by sending a no-op BulkChangeConfig
+  // that sets replace=false on the source (already false — harmless, but
+  // advances the opid_index so any subsequent request with CAS = pre_opid_index
+  // will be rejected).
+  string leader_uuid;
+  HostPort leader_hp;
+  ASSERT_OK(GetTabletLeaderForTest(rebalancer, tablet_id, &leader_uuid, &leader_hp));
+  {
+    consensus::BulkChangeConfigRequestPB req;
+    auto* modify = req.add_config_changes();
+    modify->set_type(consensus::MODIFY_PEER);
+    modify->mutable_peer()->set_permanent_uuid(src_ts_uuid);
+    modify->mutable_peer()->mutable_attrs()->set_replace(false);
+    req.set_dest_uuid(leader_uuid);
+    req.set_tablet_id(tablet_id);
+    req.set_cas_config_opid_index(pre_opid_index);
+    consensus::ChangeConfigResponsePB resp;
+    rpc::RpcController rpc_ctrl;
+    rpc_ctrl.set_timeout(MonoDelta::FromSeconds(30));
+    vector<Sockaddr> resolved;
+    ASSERT_OK(leader_hp.ResolveAddresses(&resolved));
+    // Find the tserver index for the leader.
+    int leader_ts_idx = -1;
+    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+      if (cluster_->mini_tablet_server(i)->uuid() == leader_uuid) {
+        leader_ts_idx = i;
+        break;
+      }
+    }
+    ASSERT_GE(leader_ts_idx, 0);
+    ASSERT_OK(cluster_->tserver_consensus_proxy(leader_ts_idx)->BulkChangeConfig(
+        req, &resp, &rpc_ctrl));
+    // The request may succeed or get a CAS error if the config already
+    // advanced; either way the opid_index is now > pre_opid_index.
+  }
+
+  // Construct a move with the stale pre_opid_index. ExecuteMoves reads
+  // CatalogManager's copy of the opid_index as the CAS value; since
+  // CatalogManager hasn't yet received the heartbeat carrying the new config,
+  // it still returns pre_opid_index, which the leader rejects.
+  vector<rebalance::Rebalancer::ReplicaMove> moves;
+  rebalance::Rebalancer::ReplicaMove move;
+  move.tablet_uuid = tablet_id;
+  move.ts_uuid_from = src_ts_uuid;
+  move.ts_uuid_to = dst_ts_uuid;
+  move.config_opid_idx = pre_opid_index;
+  moves.push_back(move);
+
+  // Capture the warning log to verify the failure is reported.
+  StringVectorSink sink;
+  ScopedRegisterSink reg(&sink);
+
+  ExecuteMovesForTest(rebalancer, &moves);
+
+  // The CAS-rejected move must be dropped from the vector.
+  ASSERT_TRUE(moves.empty()) << "expected CAS-rejected move to be dropped";
+
+  // Per-tserver counters must not have been incremented.
+  ASSERT_EQ(0, MovesPerTserver(rebalancer, src_ts_uuid));
+  ASSERT_EQ(0, MovesPerTserver(rebalancer, dst_ts_uuid));
+
+  // A warning should have been logged for the scheduling failure.
+  ASSERT_STRINGS_ANY_MATCH(sink.logged_msgs(), "Failed to schedule move for tablet");
+}
+
+// Verify follower-move counter increments and leader-move counter stays zero
+// when prefer_follower is enabled and RF=3 tablets (which always have followers)
+// need to be rebalanced after adding a tserver.
+TEST_F(AutoRebalancerTest, RebalancerMetricsFollowerMoves) {
+  flag_saver_ = make_unique<FlagSaver>();
+  FLAGS_auto_rebalancing_prefer_follower_replica_moves = true;
+
+  constexpr int kNumTServers = 3;
+  constexpr int kNumTablets = 4;
+
+  cluster_opts_.num_tablet_servers = kNumTServers;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+  NO_FATALS(CheckAutoRebalancerStarted());
+
+  // Create a balanced RF=3 workload so we have real followers to move.
+  CreateWorkloadTable(kNumTablets, /*num_replicas*/3);
+  NO_FATALS(CheckNoMovesScheduled());
+
+  // Snapshot rounds_completed before adding the tserver.
+  const int64_t rounds_before =
+      GetMasterCounterValue(&METRIC_auto_rebalancer_rounds_completed);
+
+  // Adding a tserver unbalances the cluster and should trigger moves. Wait
+  // until at least one full round has completed so that rounds_completed_ is
+  // stable before we snapshot the counters.
+  ASSERT_OK(cluster_->AddTabletServer());
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_GT(GetMasterCounterValue(&METRIC_auto_rebalancer_follower_moves_scheduled), 0);
+    ASSERT_GT(GetMasterCounterValue(&METRIC_auto_rebalancer_rounds_completed), rounds_before);
+  });
+
+  const int64_t follower = GetMasterCounterValue(&METRIC_auto_rebalancer_follower_moves_scheduled);
+  const int64_t leader = GetMasterCounterValue(&METRIC_auto_rebalancer_leader_moves_scheduled);
+  const int64_t rounds = GetMasterCounterValue(&METRIC_auto_rebalancer_rounds_completed);
+
+  // With prefer_follower=true and RF=3, all moves should be follower moves.
+  ASSERT_GT(follower, 0);
+  ASSERT_EQ(0, leader);
+
+  // At least one full rebalancing round must have completed since we started.
+  ASSERT_GT(rounds, rounds_before);
+}
+
+// In a stable, balanced cluster the rebalancer completes full rounds without
+// scheduling any moves. Verify that rounds_completed keeps incrementing while
+// the leader and follower move counters remain unchanged.
+TEST_F(AutoRebalancerTest, RebalancerMetricsRoundsInStableCluster) {
+  constexpr int kNumTServers = 3;
+  constexpr int kNumTablets = 6;
+
+  cluster_opts_.num_tablet_servers = kNumTServers;
+  ASSERT_OK(CreateAndStartCluster(/*enable_leader_rebalance=*/false));
+  NO_FATALS(CheckAutoRebalancerStarted());
+
+  CreateWorkloadTable(kNumTablets, /*num_replicas*/3);
+  NO_FATALS(CheckNoMovesScheduled());
+
+  const int64_t rounds_before =
+      GetMasterCounterValue(&METRIC_auto_rebalancer_rounds_completed);
+  const int64_t leader_before =
+      GetMasterCounterValue(&METRIC_auto_rebalancer_leader_moves_scheduled);
+  const int64_t follower_before =
+      GetMasterCounterValue(&METRIC_auto_rebalancer_follower_moves_scheduled);
+
+  // Wait for several more full rounds so the increment is unambiguous.
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_GT(GetMasterCounterValue(&METRIC_auto_rebalancer_rounds_completed),
+              rounds_before + 2);
+  });
+
+  // A balanced cluster must not schedule any moves.
+  ASSERT_EQ(leader_before,
+            GetMasterCounterValue(&METRIC_auto_rebalancer_leader_moves_scheduled));
+  ASSERT_EQ(follower_before,
+            GetMasterCounterValue(&METRIC_auto_rebalancer_follower_moves_scheduled));
 }
 
 } // namespace master

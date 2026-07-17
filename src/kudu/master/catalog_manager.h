@@ -43,7 +43,6 @@
 #include "kudu/consensus/raft_consensus.h"
 #include "kudu/gutil/integral_types.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/walltime.h"
@@ -652,6 +651,13 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
 
   void Shutdown();
 
+  // Used to indicate if the current master is joining an existing set of masters.
+  // If we are setting this to true from false, we shutdown the catalog manager to
+  // avoid incorrect state propagation to the leader master.
+  Status SetJoiningCluster(bool joining_existing_cluster);
+
+  bool IsJoiningCluster() const;
+
   enum TableInfoMapType {
     kNormalTableType = 1 << 0,        // normalized_table_names_map_
     kSoftDeletedTableType = 1 << 1,   // soft_deleted_table_names_map_
@@ -683,7 +689,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // but this function does not itself respond to the RPC.
   Status DeleteTableRpc(const DeleteTableRequestPB& req,
                         DeleteTableResponsePB* resp,
-                        rpc::RpcContext* rpc) WARN_UNUSED_RESULT;
+                        rpc::RpcContext* rpc);
 
   // Delete the specified table.
   Status DeleteTableWithUser(const DeleteTableRequestPB& req,
@@ -700,7 +706,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // log listener event.
   Status DeleteTableHms(const std::string& table_name,
                         const std::string& table_id,
-                        int64_t notification_log_event_id) WARN_UNUSED_RESULT;
+                        int64_t notification_log_event_id);
 
   // Recall a table in response to a RecallDeletedTableRequestPB RPC.
   //
@@ -708,7 +714,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // but this function does not itself respond to the RPC.
   Status RecallDeletedTableRpc(const RecallDeletedTableRequestPB& req,
                                RecallDeletedTableResponsePB* resp,
-                               rpc::RpcContext* rpc) WARN_UNUSED_RESULT;
+                               rpc::RpcContext* rpc);
 
   enum class AlterType {
     // Only normal type tables are allowed to be altered, not soft-deleted tables.
@@ -741,7 +747,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
                         const std::optional<std::string>& new_table_name,
                         const std::optional<std::string>& new_table_owner,
                         const std::optional<std::string>& new_table_comment,
-                        int64_t notification_log_event_id) WARN_UNUSED_RESULT;
+                        int64_t notification_log_event_id);
 
   // Get the information about an in-progress alter operation. If 'user' is
   // provided, checks that the user is authorized to get such information.
@@ -831,6 +837,12 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
                             TabletLocationsPB* locs_pb,
                             TSInfosDict* ts_infos_dict,
                             const std::optional<std::string>& user);
+
+  // Retrieve the committed consensus state for the given tablet from the
+  // master's in-memory catalog. Caller must hold leader_lock_ for reading.
+  // Returns Status::NotFound if the tablet is unknown or has no consensus state.
+  Status GetTabletConsensusState(const std::string& tablet_id,
+                                 consensus::ConsensusStatePB* cstate) const;
 
   // Replace the given tablet with a new, empty one. The replaced tablet is
   // deleted and its data is permanently lost.
@@ -995,6 +1007,8 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   FRIEND_TEST(MasterTest, TestShutdownDuringTableVisit);
   FRIEND_TEST(MasterTest, TestGetTableLocationsDuringRepeatedTableVisit);
   FRIEND_TEST(kudu::AuthzTokenTest, TestSingleMasterUnavailable);
+  // This test uses ScopedCatalogManagerNotReadyForTests.
+  FRIEND_TEST(MasterTest, PrometheusServiceDiscoveryWhenCatalogManagerNotReady);
 
   // This test calls VisitTablesAndTablets() directly.
   FRIEND_TEST(kudu::CreateTableStressTest, TestConcurrentCreateTableAndReloadMetadata);
@@ -1080,7 +1094,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   Status DeleteTable(const DeleteTableRequestPB& req,
                      DeleteTableResponsePB* resp,
                      std::optional<int64_t> hms_notification_log_event_id,
-                     const std::optional<std::string>& user) WARN_UNUSED_RESULT;
+                     const std::optional<std::string>& user);
 
   // Common logic for AlterTableRpc and AlterTableWithUser.
   // The rpc context is optional because this function is used by both AlterTableRpc (RPC API)
@@ -1103,7 +1117,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   Status AlterTable(const AlterTableRequestPB& req,
                     AlterTableResponsePB* resp,
                     std::optional<int64_t> hms_notification_log_event_id,
-                    const std::optional<std::string>& user) WARN_UNUSED_RESULT;
+                    const std::optional<std::string>& user);
 
   // Called by SysCatalog::SysCatalogStateChanged when this node
   // becomes the leader of a consensus configuration. Executes
@@ -1261,7 +1275,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
                                    const std::optional<std::string>& user,
                                    scoped_refptr<TableInfo>* table_info,
                                    TableMetadataLock* table_lock,
-                                   TableInfoMapType map_type = kAllTableType) WARN_UNUSED_RESULT;
+                                   TableInfoMapType map_type = kAllTableType);
 
   // Extract the set of tablets that must be processed because not running yet.
   void ExtractTabletsToProcess(std::vector<scoped_refptr<TabletInfo>>* tablets_to_process);
@@ -1388,7 +1402,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // response code in the case of an error.
   template <typename RespClass>
   Status WaitForNotificationLogListenerCatchUp(RespClass* resp,
-                                               rpc::RpcContext* rpc) WARN_UNUSED_RESULT;
+                                               rpc::RpcContext* rpc);
 
   enum class ValidateType {
     kCreateTable = 0,
@@ -1460,6 +1474,29 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
 
   static const char* StateToString(State state);
 
+  // Temporarily makes the catalog manager appear "not ready" by changing its
+  // state. Only for tests!
+  class ScopedCatalogManagerNotReadyForTests {
+   public:
+    explicit ScopedCatalogManagerNotReadyForTests(CatalogManager* catalog)
+        : catalog_(catalog) {
+      std::lock_guard l(catalog_->state_lock_);
+      old_state_ = catalog_->state_;
+      catalog_->state_ = kStarting;
+    }
+
+    virtual ~ScopedCatalogManagerNotReadyForTests() {
+      std::lock_guard l(catalog_->state_lock_);
+      catalog_->state_ = old_state_;
+    }
+
+   private:
+    CatalogManager* catalog_;
+    State old_state_;
+
+    DISALLOW_COPY_AND_ASSIGN(ScopedCatalogManagerNotReadyForTests);
+  };
+
   // Lock protecting state_, leader_ready_term_
   mutable simple_spinlock state_lock_;
   State state_;
@@ -1510,6 +1547,8 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // Lock protecting cluster_id_.
   mutable simple_spinlock cluster_id_lock_;
   std::string cluster_id_;
+
+  bool is_joining_existing_cluster_;
 
   DISALLOW_COPY_AND_ASSIGN(CatalogManager);
 };

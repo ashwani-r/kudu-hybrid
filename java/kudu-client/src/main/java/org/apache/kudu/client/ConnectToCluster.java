@@ -108,7 +108,7 @@ final class ConnectToCluster {
         new ConnectToMasterRequest(masterTable, timer, timeoutMillis);
     rpc.setParentRpc(parentRpc);
     Deferred<ConnectToMasterResponsePB> d = rpc.getDeferred();
-    rpc.attempt++;
+    rpc.nextAttempt();
     masterProxy.sendRpc(rpc);
 
     // If we are connecting to an older version of Kudu, we'll get an invalid request

@@ -93,12 +93,15 @@ ADD_KUDU_TEST(linked_list-test RUN_SERIAL true)
 ADD_KUDU_TEST(log-rolling-itest)
 ADD_KUDU_TEST(maintenance_mode-itest NUM_SHARDS 8 PROCESSORS 4
   DATA_FILES ../scripts/assign-location.py)
+ADD_KUDU_TEST(prometheus_auth-itest)
+ADD_KUDU_TEST(prometheus_sd-itest
+  DATA_FILES ../scripts/assign-location.py)
 ADD_KUDU_TEST(master_authz-itest RUN_SERIAL true NUM_SHARDS 8 PROCESSORS 4)
 ADD_KUDU_TEST(master_cert_authority-itest PROCESSORS 2)
 ADD_KUDU_TEST(master_failover-itest NUM_SHARDS 4 PROCESSORS 3)
 ADD_KUDU_TEST_DEPENDENCIES(master_failover-itest
   kudu)
-ADD_KUDU_TEST(master_hms-itest RUN_SERIAL true PROCESSORS 4)
+ADD_KUDU_TEST(master_hms-itest RUN_SERIAL true NUM_SHARDS 6 PROCESSORS 4)
 ADD_KUDU_TEST(master_migration-itest)
 ADD_KUDU_TEST_DEPENDENCIES(master_migration-itest
   kudu)

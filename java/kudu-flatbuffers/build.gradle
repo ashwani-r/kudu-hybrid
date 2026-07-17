@@ -82,6 +82,12 @@ javadoc {
 tasks.withType(Checkstyle).configureEach {
   enabled = false
 }
+// kudu-flatbuffers contains only generated Java sources and no Scala, so there
+// is nothing for scalafmt to format. Disable its scalafmt tasks: otherwise they
+// scan the generated sources directory and, under Gradle 9, fail because they
+// consume the output of generateFlatBuffers without declaring a dependency.
+tasks.matching { it.name.toLowerCase().contains("scalafmt") }.configureEach {
+  enabled = false
+}
 // Skip publishing kudu-flatbuffers artifact because it will always be shaded into kudu-client.
-publish.enabled = false
-publishToMavenLocal.enabled = false
+disablePublishing()

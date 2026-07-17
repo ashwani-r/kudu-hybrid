@@ -23,6 +23,7 @@ import javax.security.auth.Subject
 import javax.security.auth.login.AppConfigurationEntry
 import javax.security.auth.login.Configuration
 import javax.security.auth.login.LoginContext
+import scala.annotation.nowarn
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 import org.apache.hadoop.util.ShutdownHookManager
@@ -71,7 +72,7 @@ class KuduContext(
 
   // An accumulator that collects all the rows written to Kudu for testing only.
   // Enabled by setting captureRows = true.
-  private[kudu] var captureRows = false
+  @volatile private[kudu] var captureRows = false
   private[kudu] var rowsAccumulator: CollectionAccumulator[Row] =
     sc.collectionAccumulator[Row]("kudu.rows")
 
@@ -583,6 +584,7 @@ private object KuduContext {
    *         principal and keytab options, otherwise returns the currently
    *         active subject
    */
+  @nowarn("cat=deprecation")
   private def getSubject(sc: SparkContext): Subject = {
     val subject = Subject.getSubject(AccessController.getContext)
 

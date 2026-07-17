@@ -165,7 +165,7 @@ private class GeneratedRowIterator(
     numRows: Long)
     extends Iterator[Row] {
 
-  val sparkSchema = SparkUtil.sparkSchema(schema)
+  private[this] val sparkSchema = SparkUtil.sparkSchema(schema)
   // ignoreNull values so unset/defaulted rows can be passed through.
   val converter = new RowConverter(schema, sparkSchema, ignoreNull = true)
 

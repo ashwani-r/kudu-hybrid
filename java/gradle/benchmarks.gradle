@@ -17,7 +17,9 @@
 
 // This file contains common tasks and configuration for benchmarking.
 
-apply plugin: "me.champeau.gradle.jmh"
+import org.gradle.api.file.DuplicatesStrategy
+
+apply plugin: "me.champeau.jmh"
 
 // Add the JMH plugin dependencies.
 dependencies {
@@ -27,6 +29,6 @@ dependencies {
 
 // Configure the JMH plugin.
 jmh {
-    duplicateClassesStrategy = 'exclude'
+    duplicateClassesStrategy = DuplicatesStrategy.EXCLUDE
     zip64 = true
 }

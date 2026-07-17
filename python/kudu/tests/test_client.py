@@ -17,7 +17,7 @@
 # under the License.
 
 from kudu.compat import CompatUnitTest, long
-from kudu.tests.common import KuduTestBase
+from kudu.tests.common import KuduTestBase, master_flags
 from kudu.client import (Partitioning,
                          RangePartition,
                          ENCRYPTION_OPTIONAL,
@@ -30,6 +30,7 @@ from kudu.schema import (Schema,
                          KuduValue)
 import kudu
 import datetime
+import logging
 import time
 from pytz import utc
 try:
@@ -1222,6 +1223,7 @@ class TestSoftDelete(KuduTestBase, CompatUnitTest):
             except:
                 pass
 
+    @master_flags("--check_expired_table_interval_seconds=2")
     def test_soft_delete_and_recall_table_after_reserve_time(self):
         # Create and open the table before soft-deleting it.
         table_name = "test_soft_delete_and_recall_table_after_reserve_time"
@@ -1248,3 +1250,131 @@ class TestSoftDelete(KuduTestBase, CompatUnitTest):
         assert len(self.client.list_tables()) == 1
         assert self.client.list_tables() == [self.ex_table]
         assert len(self.client.list_soft_deleted_tables()) == 0
+
+
+class TestTableStatistics(KuduTestBase, CompatUnitTest):
+
+    @staticmethod
+    def _wait_for_stat(client, table_name, get_stat, min_value, timeout=30):
+        """Poll get_table_statistics until get_stat(stats) >= min_value or timeout.
+
+        Stats are propagated from tablet servers to the master via periodic
+        heartbeats (default ~1s), so a short polling loop is needed before
+        asserting stat values. Returns the last observed value.
+
+        Parameters
+        ----------
+        get_stat : callable
+            Extracts the desired stat from a TableStatistics object,
+            e.g. ``lambda s: s.live_row_count``.
+        min_value : int
+            Keep polling while the stat is below this value.
+        """
+        deadline = time.time() + timeout
+        value = -1
+        while time.time() < deadline:
+            value = get_stat(client.get_table_statistics(table_name))
+            if value >= min_value:
+                return value
+            time.sleep(0.5)
+        return value
+
+    def test_get_table_statistics_returns_object(self):
+        stats = self.client.get_table_statistics(self.ex_table)
+        self.assertIsNotNone(stats)
+
+    def test_on_disk_size_is_valid(self):
+        size = self._wait_for_stat(self.client, self.ex_table,
+                                   lambda s: s.on_disk_size, min_value=0)
+        self.assertGreaterEqual(size, 0,
+            "on_disk_size still {} after waiting for heartbeat propagation".format(size))
+
+    def test_live_row_count_is_valid(self):
+        count = self._wait_for_stat(self.client, self.ex_table,
+                                    lambda s: s.live_row_count, min_value=0)
+        self.assertGreaterEqual(count, 0,
+            "live_row_count still {} after waiting for heartbeat propagation".format(count))
+
+    def test_no_limits_set_on_test_table(self):
+        stats = self.client.get_table_statistics(self.ex_table)
+        self.assertEqual(stats.on_disk_size_limit, -1)
+        self.assertEqual(stats.live_row_count_limit, -1)
+
+    def test_repr_contains_expected_fields(self):
+        # ToString() format (from table_statistics-internal.h):
+        #   on disk size: <value or N/A>
+        #   live row count: <value or N/A>
+        #   on disk size limit: <value or N/A>
+        #   live row count limit: <value or N/A>
+        stats = self.client.get_table_statistics(self.ex_table)
+        result = repr(stats)
+        self.assertIn('on disk size:', result)
+        self.assertIn('live row count:', result)
+        self.assertIn('on disk size limit:', result)
+        self.assertIn('live row count limit:', result)
+
+    def test_nonexistent_table_raises_not_found(self):
+        from kudu.errors import KuduNotFound
+        with self.assertRaises(KuduNotFound):
+            self.client.get_table_statistics('nonexistent_table_xyz')
+
+    def test_live_row_count_reflects_written_data(self):
+        """live_row_count should be > 0 after the first batch and grow after a second."""
+        table_name = 'stats_test_live_row_count'
+        try:
+            self.client.create_table(table_name, self.schema, self.partitioning)
+            table = self.client.table(table_name)
+            session = self.client.new_session()
+
+            # Write first batch of 10 rows and wait for stats to propagate.
+            for i in range(10):
+                op = table.new_insert()
+                op['key'] = i
+                session.apply(op)
+            session.flush()
+            first_count = self._wait_for_stat(
+                self.client, table_name, lambda s: s.live_row_count, min_value=10)
+            self.assertEqual(first_count, 10,
+                "Expected live_row_count == 10 after first batch, got {}".format(
+                    first_count))
+
+            # Write a second batch of 10 rows and verify the count grows.
+            for i in range(10, 20):
+                op = table.new_insert()
+                op['key'] = i
+                session.apply(op)
+            session.flush()
+            second_count = self._wait_for_stat(
+                self.client, table_name, lambda s: s.live_row_count, min_value=20)
+            self.assertEqual(second_count, 20,
+                "Expected live_row_count == 20 after second batch, got {}".format(
+                    second_count))
+        finally:
+            try:
+                self.client.delete_table(table_name)
+            except Exception as e:
+                logging.info("Failed to delete table %s: %s", table_name, e)
+
+    def test_empty_table_has_zero_live_row_count(self):
+        """A freshly created table with no rows should have live_row_count of 0."""
+        table_name = 'stats_test_empty'
+        try:
+            self.client.create_table(table_name, self.schema, self.partitioning)
+            # Poll briefly to let the master register the new (empty) table.
+            count = self._wait_for_stat(
+                self.client, table_name, lambda s: s.live_row_count,
+                min_value=0, timeout=10)
+            self.assertEqual(count, 0,
+                "Expected live_row_count == 0 for empty table, got {}".format(count))
+            # on_disk_size includes WAL and tablet metadata; assert it is
+            # reported (>= 0) rather than unsupported (-1).
+            disk_size = self._wait_for_stat(
+                self.client, table_name, lambda s: s.on_disk_size,
+                min_value=0, timeout=10)
+            self.assertGreaterEqual(disk_size, 0,
+                "Expected on_disk_size >= 0 for empty table, got {}".format(disk_size))
+        finally:
+            try:
+                self.client.delete_table(table_name)
+            except Exception as e:
+                logging.info("Failed to delete table %s: %s", table_name, e)

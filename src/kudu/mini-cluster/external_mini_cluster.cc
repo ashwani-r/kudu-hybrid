@@ -147,6 +147,7 @@ ExternalMiniClusterOptions::ExternalMiniClusterOptions()
       enable_kerberos(false),
       principal("kudu"),
       hms_mode(HmsMode::NONE),
+      enable_hms_tls(false),
       enable_ranger(false),
       enable_ranger_kms(false),
       ranger_cluster_key("kuduclusterkey"),
@@ -161,6 +162,10 @@ ExternalMiniClusterOptions::ExternalMiniClusterOptions()
       enable_client_jwt(false),
       start_jwks(true),
       enable_rest_api(false) {}
+
+string ExternalMiniCluster::GetDefaultClusterRoot() {
+  return JoinPathSegments(GetTestDataDirectory(), "minicluster-data");
+}
 
 ExternalMiniCluster::ExternalMiniCluster()
   : opts_(ExternalMiniClusterOptions()) {
@@ -210,7 +215,7 @@ Status ExternalMiniCluster::HandleOptions() {
 
   if (opts_.cluster_root.empty()) {
     // If they don't specify a cluster root, use the current gtest directory.
-    opts_.cluster_root = JoinPathSegments(GetTestDataDirectory(), "minicluster-data");
+    opts_.cluster_root = GetDefaultClusterRoot();
   }
 
   if (opts_.block_manager_type.empty()) {
@@ -441,6 +446,7 @@ Status ExternalMiniCluster::Start() {
     if (opts_.hms_mode == HmsMode::DISABLE_HIVE_METASTORE) {
       hms_->EnableKuduPlugin(false);
     }
+    hms_->EnableTls(opts_.enable_hms_tls);
 
     if (opts_.enable_kerberos) {
       string spn = Substitute("hive/$0", hms_->address().host());

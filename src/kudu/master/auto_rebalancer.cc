@@ -17,9 +17,8 @@
 
 #include "kudu/master/auto_rebalancer.h"
 
-#include <cstdint>
-
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -36,6 +35,7 @@
 #include <glog/logging.h>
 
 #include "kudu/common/common.pb.h"
+#include "kudu/common/partition.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus.pb.h"
@@ -43,6 +43,7 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/catalog_manager.h"
@@ -59,6 +60,8 @@
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/cow_object.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/hexdump.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
@@ -147,14 +150,55 @@ DEFINE_bool(auto_rebalancing_fail_moves_for_test, false,
             "This is only used for test.");
 TAG_FLAG(auto_rebalancing_fail_moves_for_test, unsafe);
 
+DEFINE_bool(auto_rebalancing_prefer_follower_replica_moves, true,
+            "When true, among equally imbalanced table/move candidates the "
+            "auto-rebalancer prefers replica moves whose source tablet server "
+            "hosts a non-leader replica for that table, when that information is "
+            "available from the cluster health report. When false, no such "
+            "preference is applied. Moving a leader replica may still be chosen "
+            "when necessary or when follower availability is unknown.");
+TAG_FLAG(auto_rebalancing_prefer_follower_replica_moves, advanced);
+TAG_FLAG(auto_rebalancing_prefer_follower_replica_moves, runtime);
+
+DEFINE_bool(auto_rebalancing_enable_range_rebalancing, false,
+            "Whether to rebalance each range partition independently. "
+            "When enabled, the auto-rebalancer treats each range partition "
+            "as a separate entity for balancing purposes, allowing finer-grained "
+            "control over replica distribution across tablet servers.");
+TAG_FLAG(auto_rebalancing_enable_range_rebalancing, advanced);
+TAG_FLAG(auto_rebalancing_enable_range_rebalancing, runtime);
+
 DECLARE_bool(auto_rebalancing_enabled);
+
+METRIC_DEFINE_counter(server, auto_rebalancer_leader_moves_scheduled,
+                      "Auto-Rebalancer Leader Moves Scheduled",
+                      kudu::MetricUnit::kTablets,
+                      "Number of replica moves scheduled by the auto-rebalancer "
+                      "where the source replica was the Raft leader (follower "
+                      "candidates were unavailable on the source tablet server).",
+                      kudu::MetricLevel::kInfo);
+
+METRIC_DEFINE_counter(server, auto_rebalancer_follower_moves_scheduled,
+                      "Auto-Rebalancer Follower Moves Scheduled",
+                      kudu::MetricUnit::kTablets,
+                      "Number of replica moves scheduled by the auto-rebalancer "
+                      "where the source replica was a non-leader follower.",
+                      kudu::MetricLevel::kInfo);
+
+METRIC_DEFINE_counter(server, auto_rebalancer_rounds_completed,
+                      "Auto-Rebalancer Rounds Completed",
+                      kudu::MetricUnit::kUnits,
+                      "Number of full rebalancing cycles completed by the "
+                      "auto-rebalancer.",
+                      kudu::MetricLevel::kInfo);
 
 namespace kudu {
 
 namespace master {
 
 AutoRebalancerTask::AutoRebalancerTask(CatalogManager* catalog_manager,
-                                       TSManager* ts_manager)
+                                       TSManager* ts_manager,
+                                       const scoped_refptr<MetricEntity>& metric_entity)
     : catalog_manager_(catalog_manager),
       ts_manager_(ts_manager),
       shutdown_(1),
@@ -172,9 +216,17 @@ AutoRebalancerTask::AutoRebalancerTask(CatalogManager* catalog_manager,
       /*run_cross_location_rebalancing*/true,
       /*run_intra_location_rebalancing*/true,
       FLAGS_auto_rebalancing_load_imbalance_threshold,
-      /*force_rebalance_replicas_on_maintenance_tservers*/false))),
+      /*force_rebalance_replicas_on_maintenance_tservers*/false,
+      /*intra_location_rebalancing_concurrency*/0,
+      FLAGS_auto_rebalancing_enable_range_rebalancing))),
       random_generator_(random_device_()),
+      leader_moves_scheduled_(METRIC_auto_rebalancer_leader_moves_scheduled.Instantiate(
+          metric_entity)),
+      follower_moves_scheduled_(METRIC_auto_rebalancer_follower_moves_scheduled.Instantiate(
+          metric_entity)),
+      rounds_completed_(METRIC_auto_rebalancer_rounds_completed.Instantiate(metric_entity)),
       number_of_loop_iterations_for_test_(0),
+      moves_attempted_this_round_for_test_(0),
       moves_scheduled_this_round_for_test_(0) {
 }
 
@@ -208,6 +260,10 @@ void AutoRebalancerTask::RunLoop() {
   vector<Rebalancer::ReplicaMove> replica_moves;
   while (!shutdown_.WaitFor(
       MonoDelta::FromSeconds(FLAGS_auto_rebalancing_interval_seconds))) {
+    // Retry any stuck replace-marker cleanups first, even when rebalancing is
+    // disabled: it may have been turned off right after a round failed, and
+    // those markers still need to be cleared.
+    ProcessPendingReplaceClears();
     if (!FLAGS_auto_rebalancing_enabled) {
       // Toggling the auto-rebalancer on/off by changing FLAGS_auto_rebalancing_enabled,
       // will take effect in the next loop. Already scheduled/running replica moves will
@@ -221,12 +277,19 @@ void AutoRebalancerTask::RunLoop() {
     {
       CatalogManager::ScopedLeaderSharedLock l(catalog_manager_);
       if (!l.first_failed_status().ok()) {
+        moves_attempted_this_round_for_test_ = 0;
         moves_scheduled_this_round_for_test_ = 0;
         continue;
       }
     }
 
     number_of_loop_iterations_for_test_++;
+    // Reset the per-round counters at the start of each iteration. Otherwise a
+    // round that gets skipped later (say, BuildClusterRawInfo failing during
+    // recovery) would leave tests reading a stale count from the previous
+    // round.
+    moves_attempted_this_round_for_test_ = 0;
+    moves_scheduled_this_round_for_test_ = 0;
 
     // Structs to hold information about the cluster's status.
     ClusterRawInfo raw_info;
@@ -260,8 +323,13 @@ void AutoRebalancerTask::RunLoop() {
                                  s.ToString());
       continue;
     }
-    WARN_NOT_OK(ExecuteMoves(replica_moves),
-                "failed to send replica move request");
+    moves_attempted_this_round_for_test_ = replica_moves.size();
+    // Set to -1 as a sentinel while ExecuteMoves() is in progress, so that
+    // test assertions reading both counters cannot observe a stale
+    // moves_scheduled value from a prior round alongside the new
+    // moves_attempted value.
+    moves_scheduled_this_round_for_test_ = -1;
+    ExecuteMoves(&replica_moves);
     moves_scheduled_this_round_for_test_ = replica_moves.size();
 
     // Wait for all of the moves from this iteration to complete.
@@ -281,6 +349,9 @@ void AutoRebalancerTask::RunLoop() {
                                  << " moves after all operations completed";
     }
 #endif
+    // Only rounds that run to completion reach here; early-continue paths
+    // (BuildClusterRawInfo, GetMoves failures, etc.) skip this increment.
+    rounds_completed_->Increment();
   }
 }
 
@@ -300,7 +371,9 @@ Status AutoRebalancerTask::GetMoves(
 
   // One location: use greedy rebalancing algorithm to find moves.
   if (ts_id_by_location.size() == 1) {
-    rebalance::TwoDimensionalGreedyAlgo algo;
+    rebalance::TwoDimensionalGreedyAlgo algo(
+        rebalance::TwoDimensionalGreedyAlgo::EqualSkewOption::PICK_RANDOM,
+        FLAGS_auto_rebalancing_prefer_follower_replica_moves);
     RETURN_NOT_OK(GetMovesUsingRebalancingAlgo(raw_info, &algo, CrossLocations::NO, &rep_moves));
     *replica_moves = std::move(rep_moves);
     return Status::OK();
@@ -331,7 +404,9 @@ Status AutoRebalancerTask::GetMoves(
 
   // Perform intra-location rebalancing.
   if (config_.run_intra_location_rebalancing) {
-    rebalance::TwoDimensionalGreedyAlgo algo;
+    rebalance::TwoDimensionalGreedyAlgo algo(
+        rebalance::TwoDimensionalGreedyAlgo::EqualSkewOption::PICK_RANDOM,
+        FLAGS_auto_rebalancing_prefer_follower_replica_moves);
     for (const auto& elem : ts_id_by_location) {
       const auto& location = elem.first;
       ClusterRawInfo location_raw_info;
@@ -401,7 +476,7 @@ Status AutoRebalancerTask::GetMovesUsingRebalancingAlgo(
     }
 
     vector<string> tablet_ids;
-    rebalancer_.FindReplicas(move, raw_info, &tablet_ids);
+    const bool is_leader_move = rebalancer_.FindReplicas(move, raw_info, &tablet_ids);
     if (cross_location == CrossLocations::YES) {
       // In case of cross-location (a.k.a. inter-location) rebalancing it is
       // necessary to make sure the majority of replicas would not end up
@@ -413,7 +488,8 @@ Status AutoRebalancerTask::GetMovesUsingRebalancingAlgo(
 
     RETURN_NOT_OK(SelectReplicaToMove(move, extra_info_by_tablet_id,
                                       &random_generator_, std::move(tablet_ids),
-                                      &tablets_in_move, &rep_moves));
+                                      &tablets_in_move, &rep_moves,
+                                      is_leader_move));
   }
 
   *replica_moves = std::move(rep_moves);
@@ -447,80 +523,134 @@ Status AutoRebalancerTask::GetTabletLeader(
       return Status::OK();
     }
   }
-  return Status::NotFound(Substitute("Couldn't find leader for tablet $0", tablet_id));
+  // No leader at the moment, most likely a transient election. This is worth
+  // retrying, so don't use NotFound, which callers read as "the replica is gone".
+  return Status::ServiceUnavailable(
+      Substitute("Couldn't find leader for tablet $0", tablet_id));
 }
 
-// TODO(hannah.nguyen): remove moves that fail to be scheduled from
-// 'replica_moves'.
-Status AutoRebalancerTask::ExecuteMoves(
-    const vector<Rebalancer::ReplicaMove>& replica_moves) {
-  for (const auto& move_info : replica_moves) {
+void AutoRebalancerTask::ExecuteMoves(
+    vector<Rebalancer::ReplicaMove>* replica_moves) {
+  vector<int> failed_indices;
+
+  for (int i = 0; i < static_cast<int>(replica_moves->size()); ++i) {
+    auto& move_info = (*replica_moves)[i];
     const auto& tablet_id = move_info.tablet_uuid;
     const auto& src_ts_uuid = move_info.ts_uuid_from;
     const auto& dst_ts_uuid = move_info.ts_uuid_to;
-    string leader_uuid;
-    HostPort leader_hp;
-    RETURN_NOT_OK(GetTabletLeader(tablet_id, &leader_uuid, &leader_hp));
-    shared_ptr<TSDescriptor> leader_desc;
-    if (!ts_manager_->LookupTSByUUID(leader_uuid, &leader_desc)) {
-      return Status::NotFound(
-          Substitute("Couldn't find leader replica's tserver $0", leader_uuid));
-    }
-    // Mark the replica to be replaced.
-    BulkChangeConfigRequestPB req;
-    auto* modify_peer = req.add_config_changes();
-    modify_peer->set_type(MODIFY_PEER);
-    *modify_peer->mutable_peer()->mutable_permanent_uuid() = src_ts_uuid;
-    modify_peer->mutable_peer()->mutable_attrs()->set_replace(true);
 
-    // NOTE: 'dst_ts_uuid' is empty if the move was scheduled to fix location
-    // policy violations.
-    if (!dst_ts_uuid.empty()) {
-      // Verify that the destination tserver exists.
-      shared_ptr<TSDescriptor> dest_desc;
-      if (!ts_manager_->LookupTSByUUID(dst_ts_uuid, &dest_desc)) {
-        return Status::NotFound("Could not find destination tserver");
+    // Attempt to schedule this move. On any failure, log a warning and skip
+    // this move so the remaining moves are still attempted.
+    Status s = [&]() -> Status {
+      // Read the current config opid_index before sending BulkChangeConfig.
+      // This is stored on the move so that CheckMoveCompleted can use it as
+      // a freshness gate: if CatalogManager still shows the same opid_index
+      // after the move is dispatched, the heartbeat carrying the new config
+      // hasn't arrived yet and the check should wait rather than act on
+      // stale data.
+      ConsensusStatePB pre_cstate;
+      {
+        CatalogManager::ScopedLeaderSharedLock l(catalog_manager_);
+        RETURN_NOT_OK(l.first_failed_status());
+        RETURN_NOT_OK(catalog_manager_->GetTabletConsensusState(tablet_id, &pre_cstate));
       }
-      ServerRegistrationPB dest_reg;
-      RETURN_NOT_OK(dest_desc->GetRegistration(&dest_reg));
+      const int64_t pre_opid_index = pre_cstate.committed_config().opid_index();
 
-      auto* add_peer_change = req.add_config_changes();
-      add_peer_change->set_type(ADD_PEER);
-      auto* new_peer = add_peer_change->mutable_peer();
-      new_peer->set_permanent_uuid(dst_ts_uuid);
-      new_peer->set_member_type(RaftPeerPB::NON_VOTER);
-      new_peer->mutable_attrs()->set_promote(true);
-      *new_peer->mutable_last_known_addr() = dest_reg.rpc_addresses(0);
+      string leader_uuid;
+      HostPort leader_hp;
+      RETURN_NOT_OK(GetTabletLeader(tablet_id, &leader_uuid, &leader_hp));
+      shared_ptr<TSDescriptor> leader_desc;
+      if (!ts_manager_->LookupTSByUUID(leader_uuid, &leader_desc)) {
+        return Status::NotFound(
+            Substitute("Couldn't find leader replica's tserver $0", leader_uuid));
+      }
+      // Mark the replica to be replaced.
+      BulkChangeConfigRequestPB req;
+      auto* modify_peer = req.add_config_changes();
+      modify_peer->set_type(MODIFY_PEER);
+      *modify_peer->mutable_peer()->mutable_permanent_uuid() = src_ts_uuid;
+      modify_peer->mutable_peer()->mutable_attrs()->set_replace(true);
+
+      // NOTE: 'dst_ts_uuid' is empty if the move was scheduled to fix location
+      // policy violations.
+      if (!dst_ts_uuid.empty()) {
+        shared_ptr<TSDescriptor> dest_desc;
+        if (!ts_manager_->LookupTSByUUID(dst_ts_uuid, &dest_desc)) {
+          return Status::NotFound("Could not find destination tserver");
+        }
+        ServerRegistrationPB dest_reg;
+        RETURN_NOT_OK(dest_desc->GetRegistration(&dest_reg));
+
+        auto* add_peer_change = req.add_config_changes();
+        add_peer_change->set_type(ADD_PEER);
+        auto* new_peer = add_peer_change->mutable_peer();
+        new_peer->set_permanent_uuid(dst_ts_uuid);
+        new_peer->set_member_type(RaftPeerPB::NON_VOTER);
+        new_peer->mutable_attrs()->set_promote(true);
+        *new_peer->mutable_last_known_addr() = dest_reg.rpc_addresses(0);
+      }
+
+      // Send the change config request to the tablet leader.
+      // Set the CAS index so the request is rejected if another actor has
+      // already modified the config since we read pre_opid_index. This
+      // guarantees that if the request succeeds, the new config's opid_index
+      // is greater than pre_opid_index.
+      //
+      // Note: the opid_index read above and this RPC are not atomic. If a
+      // heartbeat delivers a config update to CatalogManager between the two
+      // calls (e.g. the leader applied an unrelated config change), the
+      // leader's committed index will be higher than pre_opid_index and the
+      // CAS will fail. The move is then treated as a scheduling failure and
+      // retried next cycle.
+      ChangeConfigResponsePB resp;
+      RpcController rpc;
+      rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
+      req.set_dest_uuid(leader_uuid);
+      req.set_tablet_id(tablet_id);
+      req.set_cas_config_opid_index(pre_opid_index);
+      vector<Sockaddr> resolved;
+      RETURN_NOT_OK(leader_hp.ResolveAddresses(&resolved));
+      ConsensusServiceProxy proxy(messenger_, resolved[0], leader_hp.host());
+      RETURN_NOT_OK(proxy.BulkChangeConfig(req, &resp, &rpc));
+      if (resp.has_error()) return StatusFromPB(resp.error().status());
+
+      // Record the config opid_index that was current before this move was
+      // dispatched. CheckMoveCompleted uses this to determine whether
+      // CatalogManager has received the heartbeat reflecting the new config.
+      move_info.config_opid_idx = pre_opid_index;
+
+      // Successfully scheduled the move. Increment counters for both source and destination.
+      moves_per_tserver_[src_ts_uuid]++;
+      if (!dst_ts_uuid.empty()) {
+        moves_per_tserver_[dst_ts_uuid]++;
+      }
+      if (move_info.is_leader_move) {
+        leader_moves_scheduled_->Increment();
+      } else {
+        follower_moves_scheduled_->Increment();
+      }
+      VLOG(1) << Substitute(
+          "Scheduled move: tablet $0 from $1 to $2 "
+          "(src_moves=$3, dst_moves=$4)",
+          tablet_id,
+          src_ts_uuid,
+          dst_ts_uuid,
+          moves_per_tserver_[src_ts_uuid],
+          dst_ts_uuid.empty() ? 0 : moves_per_tserver_[dst_ts_uuid]);
+      return Status::OK();
+    }();
+
+    if (!s.ok()) {
+      LOG(WARNING) << Substitute("Failed to schedule move for tablet $0: $1",
+                                 tablet_id, s.ToString());
+      failed_indices.push_back(i);
     }
-
-    // Send the change config request to the tablet leader.
-    ChangeConfigResponsePB resp;
-    RpcController rpc;
-    rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
-    req.set_dest_uuid(leader_uuid);
-    req.set_tablet_id(tablet_id);
-    vector<Sockaddr> resolved;
-    RETURN_NOT_OK(leader_hp.ResolveAddresses(&resolved));
-    ConsensusServiceProxy proxy(messenger_, resolved[0], leader_hp.host());
-    RETURN_NOT_OK(proxy.BulkChangeConfig(req, &resp, &rpc));
-    if (resp.has_error()) return StatusFromPB(resp.error().status());
-
-    // Successfully scheduled the move. Increment counters for both source and destination.
-    moves_per_tserver_[src_ts_uuid]++;
-    if (!dst_ts_uuid.empty()) {
-      moves_per_tserver_[dst_ts_uuid]++;
-    }
-
-    VLOG(1) << Substitute(
-        "Scheduled move: tablet $0 from $1 to $2 "
-        "(src_moves=$3, dst_moves=$4)",
-        tablet_id,
-        src_ts_uuid,
-        dst_ts_uuid,
-        moves_per_tserver_[src_ts_uuid],
-        dst_ts_uuid.empty() ? 0 : moves_per_tserver_[dst_ts_uuid]);
   }
-  return Status::OK();
+
+  // Erase failed moves back-to-front to keep indices valid during removal.
+  for (int i = static_cast<int>(failed_indices.size()) - 1; i >= 0; --i) {
+    replica_moves->erase(replica_moves->begin() + failed_indices[i]);
+  }
 }
 
 Status AutoRebalancerTask::BuildClusterRawInfo(
@@ -590,6 +720,22 @@ Status AutoRebalancerTask::BuildClusterRawInfo(
       tablet_summary.id = tablet->id();
       tablet_summary.table_id = table_summary.id;
       tablet_summary.table_name = table_summary.name;
+
+      // Extract range partition key for range-aware rebalancing
+      if (FLAGS_auto_rebalancing_enable_range_rebalancing) {
+        const auto& tablet_pb = tablet_l.data().pb;
+        if (tablet_pb.has_partition()) {
+          Partition partition;
+          Partition::FromPB(tablet_pb.partition(), &partition);
+          const auto& range_key_begin = partition.begin().range_key();
+
+          // Format as hex string for consistency with ksck.
+          tablet_summary.range_key_begin =
+              HexEncodeToString(Slice(range_key_begin));
+          VLOG(2) << "Tablet " << tablet_summary.id
+                  << " range_key_begin: " << tablet_summary.range_key_begin;
+        }
+      }
 
       // Retrieve all replicas of the tablet.
       vector<ReplicaSummary> replicas;
@@ -706,7 +852,7 @@ Status AutoRebalancerTask::BuildClusterRawInfo(
 Status AutoRebalancerTask::CheckReplicaMovesCompleted(
     vector<rebalance::Rebalancer::ReplicaMove>* replica_moves) {
 
-  bool move_is_complete;
+  bool move_is_complete = false;
   vector<int> indexes_to_remove;
 
   for (int i = 0; i < replica_moves->size(); ++i) {
@@ -720,9 +866,6 @@ Status AutoRebalancerTask::CheckReplicaMovesCompleted(
       const auto& src_ts_uuid = move.ts_uuid_from;
       const auto& dst_ts_uuid = move.ts_uuid_to;
 
-      // The counter may be zero if ExecuteMoves() failed before reaching this move.
-      // ExecuteMoves() uses RETURN_NOT_OK, which exits early on error, so later
-      // moves in replica_moves never had their counters incremented.
       if (moves_per_tserver_[src_ts_uuid] > 0) {
         moves_per_tserver_[src_ts_uuid]--;
       }
@@ -730,45 +873,50 @@ Status AutoRebalancerTask::CheckReplicaMovesCompleted(
         moves_per_tserver_[dst_ts_uuid]--;
       }
 
-      // If a move fails, clear the replace marker so the master doesn't keep
-      // trying to replace the replica indefinitely (especially for leaders).
-      BulkChangeConfigRequestPB req;
-      auto* modify_peer = req.add_config_changes();
-      modify_peer->set_type(MODIFY_PEER);
-      *modify_peer->mutable_peer()->mutable_permanent_uuid() = move.ts_uuid_from;
-      modify_peer->mutable_peer()->mutable_attrs()->set_replace(false);
-      string leader_uuid;
-      HostPort leader_hp;
-      Status clear_replace_status = GetTabletLeader(move.tablet_uuid, &leader_uuid, &leader_hp);
-      // Best-effort cleanup: failures here should not keep the move queued.
-      if (!clear_replace_status.ok()) {
-        LOG(WARNING) << "Removing replace marker failed: "
-                     << clear_replace_status.message().ToString();
-      } else {
-        ChangeConfigResponsePB resp;
-        RpcController rpc;
-        rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
-        req.set_dest_uuid(leader_uuid);
-        req.set_tablet_id(move.tablet_uuid);
-        vector<Sockaddr> resolved;
-        clear_replace_status = leader_hp.ResolveAddresses(&resolved);
-        if (!clear_replace_status.ok()) {
-          LOG(WARNING) << "Removing replace marker failed: "
-                       << clear_replace_status.message().ToString();
-        } else {
-          ConsensusServiceProxy proxy(messenger_, resolved[0], leader_hp.host());
-          clear_replace_status = proxy.BulkChangeConfig(req, &resp, &rpc);
-          if (clear_replace_status.ok() && resp.has_error()) {
-            clear_replace_status = StatusFromPB(resp.error().status());
-          }
-          if (!clear_replace_status.ok()) {
-            LOG(WARNING) << "Removing replace marker failed: "
-                         << clear_replace_status.message().ToString();
-          }
+      // Clear the replace marker so the master doesn't keep trying to replace
+      // the replica (especially painful for leaders). Right after we scheduled
+      // the move the leader may still be busy with its own config changes
+      // (promoting the new NON_VOTER, stepping down because the source is
+      // marked for replacement, or handing off leadership), so this cleanup can
+      // race with that work and get rejected. Retry transient failures with a
+      // short backoff. We can't count on the catalog manager's auto-replacement
+      // to clean this up instead, since that needs a NON_VOTER promotion which
+      // may never happen once the move is treated as failed.
+      constexpr int kMaxClearAttempts = 3;
+      Status clear_replace_status;
+      for (int attempt = 1; attempt <= kMaxClearAttempts; ++attempt) {
+        clear_replace_status = TryClearReplaceMarker(move);
+        // OK includes the case where the marker was already cleared.
+        if (clear_replace_status.ok()) break;
+        // Nothing left to clear: the replica is gone from the config (NotFound)
+        // or the marker was already cleared (InvalidArgument).
+        if (clear_replace_status.IsNotFound() ||
+            clear_replace_status.IsInvalidArgument()) {
+          clear_replace_status = Status::OK();
+          break;
+        }
+        if (attempt == kMaxClearAttempts) break;
+        // Short inline backoff (100ms, then 200ms). Anything still failing
+        // after that goes onto pending_replace_clears_ and is retried on the
+        // next loop iteration; leader transfers and pending config changes
+        // usually settle within one rebalancer interval, and spinning here
+        // any longer would just hold up ExecuteMoves.
+        const auto delay = MonoDelta::FromMilliseconds(100 * (1 << (attempt - 1)));
+        if (shutdown_.WaitFor(delay)) {
+          // Shutdown requested; bail without erasing so a rerun (if any)
+          // sees the same state.
+          return s;
         }
       }
+      if (!clear_replace_status.ok()) {
+        LOG(WARNING) << Substitute(
+            "Removing replace marker failed after $0 inline attempts; "
+            "will retry on next rebalancer loop iteration: $1",
+            kMaxClearAttempts, clear_replace_status.message().ToString());
+        pending_replace_clears_.emplace_back(move);
+      }
 
-      // Always drop the failed move so rebalancing can make progress.
+      // Drop the failed move so rebalancing can make progress.
       replica_moves->erase(replica_moves->begin() + i);
       LOG(WARNING) << Substitute("Could not move replica: $0", s.ToString());
       return s;
@@ -786,7 +934,6 @@ Status AutoRebalancerTask::CheckReplicaMovesCompleted(
     const auto& src_ts_uuid = move.ts_uuid_from;
     const auto& dst_ts_uuid = move.ts_uuid_to;
 
-    // The counter may be zero if ExecuteMoves() failed before reaching this move.
     if (moves_per_tserver_[src_ts_uuid] > 0) {
       moves_per_tserver_[src_ts_uuid]--;
     }
@@ -809,9 +956,6 @@ Status AutoRebalancerTask::CheckReplicaMovesCompleted(
   return Status::OK();
 }
 
-// TODO(hannah.nguyen): Retrieve consensus state information from the
-// CatalogManager instead. The current implementation mirrors
-// CheckCompleteMove() in tools/tool_replica_util.cc.
 Status AutoRebalancerTask::CheckMoveCompleted(
     const rebalance::Rebalancer::ReplicaMove& replica_move,
     bool* is_complete) {
@@ -827,35 +971,31 @@ Status AutoRebalancerTask::CheckMoveCompleted(
   const auto& from_ts_uuid = replica_move.ts_uuid_from;
   const auto& to_ts_uuid = replica_move.ts_uuid_to;
 
-  // Get the latest leader info. This may change later.
-  string orig_leader_uuid;
-  HostPort orig_leader_hp;
-  RETURN_NOT_OK(GetTabletLeader(tablet_uuid, &orig_leader_uuid, &orig_leader_hp));
-  shared_ptr<TSDescriptor> desc;
-  if (!ts_manager_->LookupTSByUUID(orig_leader_uuid, &desc)) {
-    return Status::NotFound("Could not find leader replica's tserver");
-  }
-  shared_ptr<ConsensusServiceProxy> proxy;
-  RETURN_NOT_OK(desc->GetConsensusProxy(messenger_, &proxy));
-
-  // Check if replica at 'to_ts_uuid' is in the config, and if it has been
-  // promoted to voter.
+  // Read consensus state from CatalogManager. CatalogManager's copy is
+  // populated via tserver-to-master heartbeats and may lag the tserver's
+  // actual Raft state by up to one heartbeat interval. We use the config
+  // opid_index recorded before BulkChangeConfig was sent (stored in
+  // replica_move.config_opid_idx) as a freshness gate: if CatalogManager
+  // still shows the same opid_index, the heartbeat carrying the new config
+  // hasn't arrived yet and we wait rather than act on stale data.
   ConsensusStatePB cstate;
-  GetConsensusStateRequestPB req;
-  GetConsensusStateResponsePB resp;
-  RpcController rpc;
-  rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
-  req.set_dest_uuid(orig_leader_uuid);
-  req.add_tablet_ids(tablet_uuid);
-  RETURN_NOT_OK(proxy->GetConsensusState(req, &resp, &rpc));
-  if (resp.has_error()) {
-    return StatusFromPB(resp.error().status());
+  {
+    CatalogManager::ScopedLeaderSharedLock l(catalog_manager_);
+    RETURN_NOT_OK(l.first_failed_status());
+    RETURN_NOT_OK(catalog_manager_->GetTabletConsensusState(tablet_uuid, &cstate));
   }
-  if (resp.tablets_size() == 0) {
-    return Status::NotFound("tablet not found:", tablet_uuid);
+
+  // config_opid_idx is always set for moves that reach this point: it is
+  // populated in ExecuteMoves immediately after BulkChangeConfig succeeds,
+  // and only successfully dispatched moves remain in replica_moves.
+  DCHECK(replica_move.config_opid_idx);
+
+  // If the opid_index hasn't advanced past what we saw before scheduling,
+  // CatalogManager hasn't yet processed the heartbeat for the new config.
+  // Return without acting so we retry on the next polling cycle.
+  if (cstate.committed_config().opid_index() <= *replica_move.config_opid_idx) {
+    return Status::OK();  // is_complete remains false; catalog not yet fresh
   }
-  DCHECK_EQ(1, resp.tablets_size());
-  cstate = resp.tablets(0).cstate();
 
   bool to_ts_uuid_in_config = false;
   bool to_ts_uuid_is_a_voter = false;
@@ -888,26 +1028,35 @@ Status AutoRebalancerTask::CheckMoveCompleted(
             "$0: source replica $1 does not have REPLACE attribute set",
             tablet_uuid, from_ts_uuid));
       }
-      // Replica to be removed is the leader.
-      // - It's possible that leadership changed and 'orig_leader_uuid' is not
-      //   the leader's UUID by the time 'cstate' was collected. Let's
-      //   cross-reference the two sources and only act if they agree.
-      // - It doesn't make sense to have the leader step down if the newly-added
-      //   replica hasn't been promoted to a voter yet, since changing
-      //   leadership can only delay that process and the stepped-down leader
-      //   replica will not be evicted until the newly added replica is promoted
-      //   to voter.
-      if (orig_leader_uuid == from_ts_uuid && orig_leader_uuid == cstate.leader_uuid()) {
-        LeaderStepDownRequestPB req;
-        LeaderStepDownResponsePB resp;
-        RpcController rpc;
-        req.set_dest_uuid(orig_leader_uuid);
-        req.set_tablet_id(tablet_uuid);
-        req.set_mode(LeaderStepDownMode::GRACEFUL);
-        rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
-        RETURN_NOT_OK(proxy->LeaderStepDown(req, &resp, &rpc));
-        if (resp.has_error()) {
-          return StatusFromPB(resp.error().status());
+      // If the source is the current leader, step it down so the Raft group
+      // can evict it once the destination is promoted to voter. It doesn't
+      // make sense to step down before that promotion, since doing so only
+      // delays the process and the stepped-down leader will not be evicted
+      // until the newly added replica is promoted to voter.
+      if (from_ts_uuid == cstate.leader_uuid()) {
+        // Re-read the leader host/port from the catalog for the step-down RPC.
+        string leader_uuid;
+        HostPort leader_hp;
+        RETURN_NOT_OK(GetTabletLeader(tablet_uuid, &leader_uuid, &leader_hp));
+        // Only proceed if the catalog-reported leader still matches.
+        if (leader_uuid == from_ts_uuid) {
+          shared_ptr<TSDescriptor> desc;
+          if (!ts_manager_->LookupTSByUUID(leader_uuid, &desc)) {
+            return Status::NotFound("Could not find leader replica's tserver");
+          }
+          shared_ptr<ConsensusServiceProxy> proxy;
+          RETURN_NOT_OK(desc->GetConsensusProxy(messenger_, &proxy));
+          LeaderStepDownRequestPB req;
+          LeaderStepDownResponsePB resp;
+          RpcController rpc;
+          req.set_dest_uuid(from_ts_uuid);
+          req.set_tablet_id(tablet_uuid);
+          req.set_mode(LeaderStepDownMode::GRACEFUL);
+          rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
+          RETURN_NOT_OK(proxy->LeaderStepDown(req, &resp, &rpc));
+          if (resp.has_error()) {
+            return StatusFromPB(resp.error().status());
+          }
         }
       }
 
@@ -922,6 +1071,124 @@ Status AutoRebalancerTask::CheckMoveCompleted(
   }
 
   return Status::OK();
+}
+
+Status AutoRebalancerTask::TryClearReplaceMarker(
+    const Rebalancer::ReplicaMove& move) {
+  string leader_uuid;
+  HostPort leader_hp;
+  // Resolving the leader also re-checks our own catalog leadership (it takes the
+  // leader lock), so if we've lost it here, or there's no tablet leader yet, we
+  // bail out and the caller leaves the marker pending.
+  RETURN_NOT_OK(GetTabletLeader(move.tablet_uuid, &leader_uuid, &leader_hp));
+  vector<Sockaddr> resolved;
+  RETURN_NOT_OK(leader_hp.ResolveAddresses(&resolved));
+  ConsensusServiceProxy proxy(messenger_, resolved[0], leader_hp.host());
+
+  // Try to clear only the marker our own move set, and only if nobody has
+  // touched the config since. Other actors (an operator running
+  // `kudu cluster rebalance`, or the catalog re-replicating an under-replicated
+  // tablet) can set 'replace' on the same replica for good reasons, and clearing
+  // that out from under them would interfere with their work and move replicas
+  // around for no reason. So read the current config and CAS the clear against
+  // its opid_index below. We read from the leader rather than the catalog, whose
+  // view lags by a heartbeat and would give a stale opid.
+  ConsensusStatePB cstate;
+  {
+    GetConsensusStateRequestPB req;
+    GetConsensusStateResponsePB resp;
+    RpcController rpc;
+    rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
+    req.set_dest_uuid(leader_uuid);
+    req.add_tablet_ids(move.tablet_uuid);
+    RETURN_NOT_OK(proxy.GetConsensusState(req, &resp, &rpc));
+    if (resp.has_error()) {
+      return StatusFromPB(resp.error().status());
+    }
+    if (resp.tablets_size() != 1 || !resp.tablets(0).has_cstate()) {
+      // Leader didn't return this tablet (yet); treat as transient and retry.
+      return Status::ServiceUnavailable(Substitute(
+          "leader $0 did not report consensus state for tablet $1",
+          leader_uuid, move.tablet_uuid));
+    }
+    cstate = resp.tablets(0).cstate();
+  }
+
+  const RaftPeerPB* src_peer = nullptr;
+  for (const auto& peer : cstate.committed_config().peers()) {
+    if (peer.permanent_uuid() == move.ts_uuid_from) {
+      src_peer = &peer;
+      break;
+    }
+  }
+  // Replica already gone from the config; nothing to clear.
+  if (!src_peer) {
+    return Status::NotFound(Substitute(
+        "replica $0 is no longer in tablet $1's config",
+        move.ts_uuid_from, move.tablet_uuid));
+  }
+  // Marker already cleared, so skip the no-op change and leave the config alone.
+  if (!src_peer->attrs().replace()) {
+    return Status::OK();
+  }
+
+  BulkChangeConfigRequestPB req;
+  auto* modify_peer = req.add_config_changes();
+  modify_peer->set_type(MODIFY_PEER);
+  *modify_peer->mutable_peer()->mutable_permanent_uuid() = move.ts_uuid_from;
+  modify_peer->mutable_peer()->mutable_attrs()->set_replace(false);
+  req.set_dest_uuid(leader_uuid);
+  req.set_tablet_id(move.tablet_uuid);
+  // CAS against the config we just read: if anyone changes it before this lands,
+  // the leader rejects us (CAS_FAILED) and we retry fresh instead of clobbering
+  // their change.
+  //
+  // The CAS narrows this window but does not fully close it. It proves the
+  // config did not change between the read above and this request, but it
+  // cannot prove the 'replace' marker we clear is the one our failed move set:
+  // another actor could have set 'replace' on this same replica at the same
+  // opid. That is more likely when we reach here from ProcessPendingReplaceClears()
+  // on a later RunLoop iteration, where more time has passed since the move
+  // failed. We accept this: a spurious clear cannot leave the tablet
+  // under-replicated forever, since the catalog re-replicates genuinely
+  // under-replicated tablets on its own, independent of the 'replace' attribute.
+  // At worst it delays a proactive replacement, which is retried.
+  req.set_cas_config_opid_index(cstate.committed_config().opid_index());
+
+  ChangeConfigResponsePB resp;
+  RpcController rpc;
+  rpc.set_timeout(MonoDelta::FromSeconds(FLAGS_auto_rebalancing_rpc_timeout_seconds));
+  RETURN_NOT_OK(proxy.BulkChangeConfig(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  return Status::OK();
+}
+
+void AutoRebalancerTask::ProcessPendingReplaceClears() {
+  if (pending_replace_clears_.empty()) {
+    return;
+  }
+  // Without catalog leadership we can't resolve tablet leaders, and any
+  // marker we left behind is now the new leader's responsibility.
+  {
+    CatalogManager::ScopedLeaderSharedLock l(catalog_manager_);
+    if (!l.first_failed_status().ok()) {
+      return;
+    }
+  }
+  vector<Rebalancer::ReplicaMove> still_pending;
+  still_pending.reserve(pending_replace_clears_.size());
+  for (const auto& move : pending_replace_clears_) {
+    Status s = TryClearReplaceMarker(move);
+    if (s.ok() || s.IsNotFound() || s.IsInvalidArgument()) {
+      // Nothing left to do: cleared (OK, including the already-clear case) or
+      // the replica is gone from the config (NotFound).
+      continue;
+    }
+    still_pending.emplace_back(move);
+  }
+  pending_replace_clears_ = std::move(still_pending);
 }
 
 } // namespace master

@@ -79,28 +79,74 @@ task initializeTasks() {
   }
 }
 
+// The subprojects whose source participates in the aggregate Javadoc.
+// kudu-jepsen is excluded: it is a Clojure-only module (no Java sources, so
+// it contributes nothing to the docs) and it pulls in the unpublished
+// jepsen:jepsen dependency, which cannot be resolved from Maven.
+def javadocSubprojects = subprojects.findAll { it.name != "kudu-jepsen" }
+
+// Gradle 9 forbids a task in one project from resolving another project's
+// configuration directly, so the root javadocAggregate task can no longer
+// read each subproject's compileClasspath (the same restriction the
+// copyDistTestJars task below works around). Instead, each subproject copies
+// its own compileClasspath jars -- resolved within the subproject, and
+// including compileOnly deps such as Flink that the docs need to compile
+// against -- into a shared directory that the root task points its classpath
+// at.
+def javadocClasspathDir = "${rootProject.buildDir}/javadoc-classpath"
+configure(javadocSubprojects) {
+  tasks.register("copyJavadocClasspathJars", Copy) {
+    into javadocClasspathDir
+    from configurations.compileClasspath
+    // Same-named jars across subprojects are identical transitive deps.
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+  }
+}
+
 task javadocAggregate(type: Javadoc, group: "Documentation") {
+  dependsOn javadocSubprojects.collect { it.tasks.named("copyJavadocClasspathJars") }
   description = "Generates Aggregate Javadoc API documentation for the main source code."
-  source subprojects.collect { it.sourceSets.main.allJava }
-  classpath = files(subprojects.collect { it.sourceSets.main.compileClasspath })
+  source javadocSubprojects.collect { it.sourceSets.main.allJava }
+  classpath = fileTree(dir: javadocClasspathDir, include: "*.jar")
   destinationDir = file("${buildDir}/docs/javadoc")
 }
+
+// The subprojects whose tests participate in the distributed test run.
+// kudu-jepsen is excluded: it is a Clojure-only module that disables all of
+// its tasks on JDK 12+ and whose tests never run as dist-tests. Including it
+// would also make the tasks below resolve its testRuntimeClasspath without it
+// ever being resolved in-project, which Gradle 9 forbids (see below).
+def distTestSubprojects = subprojects.findAll { it.name != "kudu-jepsen" }
 
 // Copies all the dependency jars locally so that we can reference
 // them inside the project structure while running the distributed
 // tests instead of in the gradle cache which is in the users home
 // directory by default.
-task copyDistTestJars(type: Copy) {
-  into "$buildDir/jars/"
-  from subprojects.collect {
-    it.configurations.testRuntimeClasspath
+//
+// Each subproject copies its own test runtime classpath into the shared
+// jars directory. Gradle 9 forbids a task in one project from resolving
+// another project's configuration (here testRuntimeClasspath) directly,
+// so the aggregating root task below only wires up the per-project copies.
+configure(distTestSubprojects) {
+  tasks.register("copyDistTestJars", Copy) {
+    into "${rootProject.buildDir}/jars/"
+    from configurations.testRuntimeClasspath
+    // Same-named jars across subprojects are identical transitive deps, so
+    // skipping duplicates is deterministic and avoids last-writer-wins races.
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
   }
 }
 
+task copyDistTestJars {
+  dependsOn distTestSubprojects.collect { it.tasks.named("copyDistTestJars") }
+}
+
 // Task called by dist_test.py to generate the needed .isolate and .gen.json
-// files needed to run the distributed tests.
+// files needed to run the distributed tests. It only reads each test task's
+// classpath, which the per-project copyDistTestJars tasks above have already
+// resolved in-project, so distTest never triggers cross-project resolution.
 task distTest(type: DistTestTask, dependsOn: copyDistTestJars) {
-  subprojects.each {
+  distTestSubprojects.each {
     it.tasks.withType(Test).each {
       addTestTask it
     }

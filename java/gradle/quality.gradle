@@ -17,6 +17,9 @@
 
 // This file contains common tasks and configuration for checking the quality of the code.
 
+import com.github.spotbugs.snom.Confidence
+import com.github.spotbugs.snom.Effort
+
 apply plugin: "com.github.spotbugs"   // Performs static code analysis to look for bugs in Java code.
 apply plugin: "com.github.ben-manes.versions" // Provides a task to determine which dependencies have updates.
 apply plugin: "ru.vyarus.animalsniffer" // Ensures Java code uses APIs from a particular version of Java.
@@ -38,7 +41,7 @@ if (!propertyExists("skipCodeStyleChecks")) {
   apply plugin: "checkstyle"
 
   // Automatically formats Scala code on each build.
-  apply plugin: "scalafmt"
+  apply plugin: "cz.augi.gradle.scalafmt"
 
   checkstyle {
     toolVersion = versions.checkstyle
@@ -46,6 +49,15 @@ if (!propertyExists("skipCodeStyleChecks")) {
     ignoreFailures = ignoreCheckFailures
     maxWarnings = 0
     showViolations = true
+  }
+
+  // Generated sources (e.g., protobuf output) are machine-produced and do not
+  // follow our handwritten style rules; exclude them from Checkstyle input.
+  tasks.withType(Checkstyle).configureEach {
+    exclude { details ->
+      details.file.toPath().startsWith(
+          project.layout.buildDirectory.dir("generated").get().asFile.toPath())
+    }
   }
 
   // Create an aggregate checkstyle task.
@@ -67,17 +79,19 @@ if (!propertyExists("skipCodeStyleChecks")) {
 }
 
 spotbugs {
-  toolVersion = versions.spotBugs
   ignoreFailures = ignoreCheckFailures
-  effort = "max"
-  reportLevel = "low"
+  effort = Effort.MAX
+  // The Confidence.LOW entry carries a class body, so under Groovy
+  // `Confidence.LOW` resolves to the synthetic nested type Confidence$LOW
+  // rather than the enum constant; valueOf("LOW") is required here.
+  reportLevel = Confidence.valueOf("LOW")
   excludeFilter = file("$rootProject.projectDir/config/spotbugs/excludeFilter.xml")
 }
 
 tasks.withType(com.github.spotbugs.snom.SpotBugsTask) {
   reports {
-    xml.enabled false
-    html.enabled true
+    xml.required = false
+    html.required = true
   }
 }
 
@@ -125,26 +139,47 @@ if (project.name != "kudu-proto" && project.name != "kudu-jepsen" &&
   }
   tasks.withType(JacocoReport) {
     reports {
-      csv.enabled false
-      xml.enabled true
-      html.enabled true
+      csv.required = false
+      xml.required = true
+      html.required = true
     }
   }
-  jacocoTestReport {
-    dependsOn test // tests are required to run before generating the report
+  // In coverage builds (-PgenerateCoverage), wire jacocoTestReport as a
+  // finalizer of the test task so it always runs even if tests fail, ensuring
+  // coverage data from .exec files is never silently discarded on a partial
+  // test failure. Because jacocoTestReport has no dependsOn test, there is no
+  // hard dependency chain jacocoAggregatedReport -> jacocoTestReport -> test, so
+  // a failed test task does not cause Gradle to skip jacocoAggregatedReport.
+  // When the coverage aggregation step runs as a separate Gradle invocation,
+  // jacocoTestReport is UP-TO-DATE (already ran as a finalizer) and is skipped,
+  // so tests are never re-executed.
+  // See: https://docs.gradle.org/current/userguide/jacoco_plugin.html#sec:jacoco_getting_started
+  if (project.hasProperty("generateCoverage")) {
+    test {
+      finalizedBy jacocoTestReport
+    }
   }
 }
 
-// Define a Java API signature for use by animal-sniffer. It'll enforce that all
-// Java API usage adheres to this signature.
-dependencies {
-  signature "org.codehaus.mojo.signature:java1$javaCompatibility:1.0@signature"
-}
+def enableAnimalSniffer = !JavaVersion.current().isJava11Compatible()
+if (enableAnimalSniffer) {
+  // Define a Java API signature for use by animal-sniffer. It'll enforce that all
+  // Java API usage adheres to this signature.
+  dependencies {
+    signature "org.codehaus.mojo.signature:java18:1.0@signature"
+  }
 
-// Create an aggregate animal-sniffer task.
-// This simplifies running animal-sniffer on all the code by only needing one task instead of multiple in your command.
-task animalsniffer(dependsOn: [animalsnifferMain, animalsnifferTest], group: "Verification") {
-  description = "Run animal-sniffer analysis."
+  // Create an aggregate animal-sniffer task.
+  // This simplifies running animal-sniffer on all the code by only needing one task instead of multiple in your command.
+  task animalsniffer(dependsOn: [animalsnifferMain, animalsnifferTest], group: "Verification") {
+    description = "Run animal-sniffer analysis."
+  }
+} else {
+  // Animal Scents signatures are only available up to Java 8.
+  // On JDK 11+, animalsniffer reports false positives for valid JDK APIs.
+  tasks.matching { task -> task.name.startsWith("animalsniffer") }.configureEach {
+    enabled = false
+  }
 }
 
 // Configure the versions plugin to only show dependency updates for released versions.

@@ -37,7 +37,7 @@ public class TestReplication extends ReplicationTestBase {
 
     createAllTypesTable(sinkClient);
 
-    envProvider.getEnv().executeAsync();
+    executeReplicationJobAsync();
 
     KuduTable sinkTable = sinkClient.openTable(TABLE_NAME);
     assertEventuallyTrue("Initial 10 rows should be replicated",
@@ -51,7 +51,7 @@ public class TestReplication extends ReplicationTestBase {
     createAllTypesTable(sourceClient);
     createAllTypesTable(sinkClient);
 
-    envProvider.getEnv().executeAsync();
+    executeReplicationJobAsync();
 
     KuduTable sinkTable = sinkClient.openTable(TABLE_NAME);
 

@@ -340,12 +340,6 @@ fetch_and_patch \
  $LIBUNWIND_PATCHLEVEL \
  "patch -p1 < $TP_DIR/patches/libunwind-trace-cache-destructor.patch"
 
-PYTHON_PATCHLEVEL=0
-fetch_and_patch \
- python-${PYTHON_VERSION}.tar.gz \
- $PYTHON_SOURCE \
- $PYTHON_PATCHLEVEL
-
 LLVM_PATCHLEVEL=10
 fetch_and_patch \
  llvm-${LLVM_VERSION}-iwyu-${IWYU_VERSION}.src.tar.gz \
@@ -387,12 +381,11 @@ fetch_and_patch \
  $TRACE_VIEWER_SOURCE \
  $TRACE_VIEWER_PATCHLEVEL
 
-BOOST_PATCHLEVEL=1
+BOOST_PATCHLEVEL=0
 fetch_and_patch \
- boost_${BOOST_VERSION}.tar.gz \
+ boost-${BOOST_VERSION}-cmake.tar.gz \
  $BOOST_SOURCE \
- $BOOST_PATCHLEVEL \
- "patch -p0 < $TP_DIR/patches/boost-bootstrap.patch"
+ $BOOST_PATCHLEVEL
 
 BREAKPAD_PATCHLEVEL=8
 fetch_and_patch \
@@ -422,11 +415,15 @@ fetch_and_patch \
  $SPARSEPP_SOURCE \
  $SPARSEPP_PATCHLEVEL
 
-THRIFT_PATCHLEVEL=0
+THRIFT_PATCHLEVEL=1
 fetch_and_patch \
  $THRIFT_NAME.tar.gz \
  $THRIFT_SOURCE \
- $THRIFT_PATCHLEVEL
+ $THRIFT_PATCHLEVEL \
+ "patch -p1 < $TP_DIR/patches/thrift-e96bc4015.patch" \
+ "patch -p1 < $TP_DIR/patches/thrift-c1457c69f.patch" \
+ "patch -p1 < $TP_DIR/patches/thrift-5748bbb6b.patch" \
+ "patch -p1 < $TP_DIR/patches/thrift-e3c8c534c.patch"
 
 BISON_PATCHLEVEL=0
 fetch_and_patch \
@@ -517,6 +514,12 @@ fetch_and_patch \
  $ROCKSDB_SOURCE \
  $ROCKSDB_PATCHLEVEL \
  "patch -p1 < $TP_DIR/patches/rocksdb-gcc13.patch"
+
+PROMETHEUS_PATCHLEVEL=0
+fetch_and_patch \
+ ${PROMETHEUS_NAME}.tar.gz \
+ ${PROMETHEUS_SOURCE} \
+ ${PROMETHEUS_PATCHLEVEL}
 
 echo "---------------"
 echo "Thirdparty dependencies downloaded successfully"

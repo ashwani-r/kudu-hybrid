@@ -20,6 +20,7 @@ package org.apache.kudu.client;
 import java.util.TreeSet;
 import javax.annotation.concurrent.GuardedBy;
 
+import com.google.common.base.Preconditions;
 import org.apache.yetus.audience.InterfaceAudience;
 
 /**
@@ -79,10 +80,12 @@ public class RequestTracker {
    * @param sequenceId the sequence id to mark as complete
    */
   public void rpcCompleted(long sequenceId) {
-    assert sequenceId != NO_SEQ_NO;
+    Preconditions.checkArgument(sequenceId != NO_SEQ_NO,
+        "sequenceId must not be NO_SEQ_NO");
     synchronized (lock) {
       boolean removed = incompleteRpcs.remove(sequenceId);
-      assert (removed) : "Could not remove seqid " + sequenceId + " from request tracker";
+      Preconditions.checkState(removed,
+          "Could not remove seqid %s from request tracker", sequenceId);
     }
   }
 

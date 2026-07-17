@@ -59,10 +59,10 @@ import scala.collection.mutable
  */
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
-class BackupIO(val conf: Configuration, rootPathStr: String) {
+final class BackupIO(val conf: Configuration, rootPathStr: String) {
   val log: Logger = LoggerFactory.getLogger(getClass)
 
-  val rootPath: Path = new Path(rootPathStr)
+  private[this] val rootPath: Path = new Path(rootPathStr)
   val fs: FileSystem = rootPath.getFileSystem(conf)
 
   /**

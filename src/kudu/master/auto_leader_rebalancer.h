@@ -21,6 +21,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -72,11 +73,40 @@ class AutoLeaderRebalancerTask {
   // Runs the main loop of the auto-leader-rebalancing thread.
   void RunLoop();
 
-  // Run Leader Rebalance for a table
+  // Run Leader Rebalance for a table.
+  // global_leader_count, when provided, is read as a tiebreaker during destination scoring and
+  // updated with every planned move so that successive table calls share a consistent view of
+  // in-round leader distribution.
+  // num_scheduled_moves, when provided, is incremented by the number of leader transfers planned
+  // for this table, letting the caller tell whether per-table balancing still has work to do.
   Status RunLeaderRebalanceForTable(
       const scoped_refptr<TableInfo>& table_info,
       const std::vector<std::string>& tserver_uuids,
       const std::unordered_set<std::string>& exclude_dest_uuids,
+      std::unordered_map<std::string, int>* global_leader_count = nullptr,
+      AutoLeaderRebalancerTask::ExecuteMode mode = AutoLeaderRebalancerTask::ExecuteMode::NORMAL,
+      int* num_scheduled_moves = nullptr);
+
+  // Runs a global corrective pass once every table has been balanced on its
+  // own by RunLeaderRebalanceForTable. Per-table balancing keeps each table
+  // within floor/ceil of its own average, but it can still leave the cluster
+  // globally skewed when the same tserver repeatedly receives the ceiling
+  // (the extra '+1') allocation across many tables, e.g. lots of single-tablet
+  // or otherwise indivisible tables whose lone leader keeps landing on it.
+  //
+  // 'global_leader_count' is the in-round leader distribution accumulated by
+  // the per-table calls. Tservers above the global ceiling are treated as move
+  // sources and tservers below the global ceiling as destinations. A leader is
+  // only transferred when the destination holds strictly fewer of that table's
+  // leaders than the source, so the move improves global balance without
+  // pushing the affected table out of its own floor/ceil range. The map is
+  // updated for every planned move so successive tables share a consistent
+  // view.
+  Status RunGlobalLeaderRebalance(
+      const std::vector<scoped_refptr<TableInfo>>& table_infos,
+      const std::vector<std::string>& tserver_uuids,
+      const std::unordered_set<std::string>& exclude_dest_uuids,
+      std::unordered_map<std::string, int>* global_leader_count,
       AutoLeaderRebalancerTask::ExecuteMode mode = AutoLeaderRebalancerTask::ExecuteMode::NORMAL);
 
   // Only one task can be scheduled at a time.

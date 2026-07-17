@@ -28,6 +28,7 @@ import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
 import com.stumbleupon.async.Callback;
 import org.hamcrest.CoreMatchers;
+import org.hamcrest.MatcherAssert;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
@@ -83,7 +84,7 @@ public class TestConnectToCluster {
                 ".*Client configured with 1 master\\(s\\) " +
                 "\\(.+?\\) but cluster indicates it expects 3 master\\(s\\) " +
                 "\\(.+?,.+?,.+?\\).*"));
-        Assert.assertThat(Joiner.on("\n").join(e.getStackTrace()),
+        MatcherAssert.assertThat(Joiner.on("\n").join(e.getStackTrace()),
             CoreMatchers.containsString("testConnectToOneOfManyMasters"));
       }
     }

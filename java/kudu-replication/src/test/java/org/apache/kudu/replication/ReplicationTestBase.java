@@ -21,11 +21,13 @@ import static org.apache.kudu.test.ClientTestUtil.getSchemaWithAllTypes;
 
 import java.io.File;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import org.apache.flink.api.common.JobID;
@@ -33,6 +35,8 @@ import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.client.program.ClusterClient;
 import org.apache.flink.connector.kudu.connector.reader.KuduReaderConfig;
 import org.apache.flink.connector.kudu.connector.writer.KuduWriterConfig;
+import org.apache.flink.core.execution.JobClient;
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.rules.TemporaryFolder;
@@ -70,6 +74,7 @@ public class ReplicationTestBase {
   protected KuduClient sinkClient;
   protected ReplicationEnvProvider envProvider;
   protected Path checkpointDir;
+  private final List<JobClient> startedJobClients = new ArrayList<>();
 
   @Before
   public void setupClientsAndEnvProvider() throws Exception {
@@ -80,6 +85,29 @@ public class ReplicationTestBase {
             createDefaultJobConfig(),
             createDefaultReaderConfig(),
             createDefaultWriterConfig());
+  }
+
+  @After
+  public void cancelStartedJobs() {
+    for (int i = startedJobClients.size() - 1; i >= 0; i--) {
+      JobClient jobClient = startedJobClients.get(i);
+      try {
+        jobClient.cancel().get(30, TimeUnit.SECONDS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        LOG.warn("Interrupted while cancelling Flink job {}", jobClient.getJobID(), e);
+        break;
+      } catch (Exception e) {
+        LOG.debug("Ignoring failure while cancelling Flink job {}", jobClient.getJobID(), e);
+      }
+    }
+    startedJobClients.clear();
+  }
+
+  protected JobClient executeReplicationJobAsync() throws Exception {
+    JobClient jobClient = envProvider.getEnv().executeAsync();
+    startedJobClients.add(jobClient);
+    return jobClient;
   }
 
 

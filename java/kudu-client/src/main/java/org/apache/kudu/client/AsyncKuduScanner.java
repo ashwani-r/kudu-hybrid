@@ -39,16 +39,13 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import com.google.common.collect.ImmutableList;
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import com.google.protobuf.Message;
 import com.google.protobuf.UnsafeByteOperations;
 import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
-import io.netty.util.HashedWheelTimer;
 import io.netty.util.Timeout;
 import io.netty.util.TimerTask;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -256,11 +253,14 @@ public final class AsyncKuduScanner {
 
   private final ResourceMetrics resourceMetrics = new ResourceMetrics();
 
-  private boolean closed = false;
+  private volatile boolean closed = false;
 
-  private boolean canRequestMore = true;
+  private volatile boolean canRequestMore = true;
 
-  private long numRowsReturned = 0;
+  // Written only from the scan response path (a single thread advances a given
+  // scanner at a time), so the non-atomic '+=' update is safe; 'volatile' is
+  // here purely to publish the running count to other threads that read it.
+  private volatile long numRowsReturned = 0;
 
   private RowDataFormat rowDataFormat = RowDataFormat.ROWWISE;
 
@@ -1377,7 +1377,7 @@ public final class AsyncKuduScanner {
       return "ScanRequest(scannerId=" + Bytes.pretty(scannerId) +
           ", state=" + state +
           (tablet != null ? ", tablet=" + tablet.getTabletId() : "") +
-          ", attempt=" + attempt + ", " + super.toString() + ")";
+          ", attempt=" + getAttempt() + ", " + super.toString() + ")";
     }
 
     @Override

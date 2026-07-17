@@ -22,7 +22,6 @@
 #include <memory>
 #include <string>
 
-#include "kudu/gutil/port.h"
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
@@ -37,6 +36,10 @@ namespace hms {
 class MiniHms {
  public:
 
+  // Build path to the file with trusted CA certificates for the specified
+  // data root.
+  static std::string BuildCaCertFilePath(const std::string& data_root);
+
   MiniHms();
 
   ~MiniHms();
@@ -46,6 +49,9 @@ class MiniHms {
                       std::string service_principal,
                       std::string keytab_file,
                       rpc::SaslProtection::Type protection);
+
+  // Configures whether the mini HMS uses SSL/TLS for its Thrift interface.
+  void EnableTls(bool enable);
 
   // Configures the mini HMS to enable or disable the Kudu plugin.
   void EnableKuduPlugin(bool enable);
@@ -61,19 +67,19 @@ class MiniHms {
   //
   // If the MiniHms has already been started and stopped, it will be restarted
   // using the same listening port.
-  Status Start() WARN_UNUSED_RESULT;
+  Status Start();
 
   // Stops the mini Hive metastore.
-  Status Stop() WARN_UNUSED_RESULT;
+  Status Stop();
 
   // Pause the Hive metastore process.
-  Status Pause() WARN_UNUSED_RESULT;
+  Status Pause();
 
   // Unpause the Hive metastore process.
-  Status Resume() WARN_UNUSED_RESULT;
+  Status Resume();
 
   // Delete the HMS database directory.
-  Status DeleteDatabaseDir() WARN_UNUSED_RESULT;
+  Status DeleteDatabaseDir();
 
   // Returns the address of the Hive metastore. Should only be called after the
   // metastore is started.
@@ -90,19 +96,34 @@ class MiniHms {
     return !keytab_file_.empty();
   }
 
+  // Returns true when SSL/TLS is enabled.
+  bool IsTlsEnabled() const {
+    return tls_enabled_;
+  }
+
+  // Returns absolute path to the file with the CA certificate (PEM format)
+  // that the Thrift server's TLS certificate is signed with.
+  std::string ca_cert_file_path() const;
+
+  // Returns absolute path to HMS's JKS CA keystore location.
+  std::string ca_keystore_path() const;
+
  private:
 
   // Creates a security.properties file for use via `-Djava.security.properties` in the mini HMS.
-  Status CreateSecurityProperties() const WARN_UNUSED_RESULT;
+  Status CreateSecurityProperties() const;
 
   // Creates a hive-site.xml for the mini HMS.
-  Status CreateHiveSite() const WARN_UNUSED_RESULT;
+  Status CreateHiveSite() const;
 
   // Creates a core-site.xml for the mini HMS.
-  Status CreateCoreSite() const WARN_UNUSED_RESULT;
+  Status CreateCoreSite() const;
 
   // Creates a log4j2 configuration properties file for the mini HMS.
-  Status CreateLogConfig() const WARN_UNUSED_RESULT;
+  Status CreateLogConfig() const;
+
+  // Creates the keystore files required for the mini HMS's SSL/TLS endpoint.
+  Status CreateTlsKeyStore(const std::string& java_home);
 
   std::unique_ptr<Subprocess> hms_process_;
   MonoDelta notification_log_ttl_ = MonoDelta::FromSeconds(86400);
@@ -117,6 +138,12 @@ class MiniHms {
   std::string service_principal_;
   std::string keytab_file_;
   rpc::SaslProtection::Type protection_ = rpc::SaslProtection::kAuthentication;
+
+  // TLS/SSL and keystore-related parameters required to enable TLS-protected
+  // Thrift connections.
+  bool tls_enabled_ = false;
+  std::string key_store_path_;
+  std::string key_store_password_;
 
   // Whether to enable the Kudu listener plugin.
   bool enable_kudu_plugin_ = true;

@@ -61,6 +61,7 @@
 #include "kudu/fs/io_context.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/threading/thread_collision_warner.h"
@@ -1764,7 +1765,7 @@ Status Tablet::AlterSchema(AlterSchemaOpState* op_state) {
 
   // If the current schema and the new one are equal, there is nothing to do.
   if (same_schema) {
-    return metadata_->Flush();
+    return FlushTabletMetadataAndUpdateMetrics();
   }
 
   return FlushUnlocked();
@@ -2007,10 +2008,20 @@ void Tablet::CancelMaintenanceOps() {
   }
 }
 
+void Tablet::UpdateOrphanBlockMetrics(
+    const TabletMetadata::OrphanBlockCleanupStats& stats) {
+  if (!metrics_) {
+    return;
+  }
+  metrics_->orphaned_blocks_cleaned->IncrementBy(stats.blocks_cleaned);
+  metrics_->orphaned_block_cleanup_failures->IncrementBy(stats.blocks_failed);
+}
+
 Status Tablet::FlushMetadata(const RowSetVector& to_remove,
                              const RowSetMetadataVector& to_add,
                              int64_t mrs_being_flushed,
                              const vector<TxnInfoBeingFlushed>& txns_being_flushed) {
+  TabletMetadata::OrphanBlockCleanupStats orphan_stats;
   RowSetMetadataIds to_remove_meta;
   for (const shared_ptr<RowSet>& rowset : to_remove) {
     // Skip MemRowSet & DuplicatingRowSets which don't have metadata.
@@ -2020,8 +2031,18 @@ Status Tablet::FlushMetadata(const RowSetVector& to_remove,
     to_remove_meta.insert(rowset->metadata()->id());
   }
 
-  return metadata_->UpdateAndFlush(to_remove_meta, to_add, mrs_being_flushed,
-                                   txns_being_flushed);
+  RETURN_NOT_OK(metadata_->UpdateAndFlush(to_remove_meta, to_add, mrs_being_flushed,
+                                          txns_being_flushed, &orphan_stats));
+
+  UpdateOrphanBlockMetrics(orphan_stats);
+  return Status::OK();
+}
+
+Status Tablet::FlushTabletMetadataAndUpdateMetrics() {
+  TabletMetadata::OrphanBlockCleanupStats orphan_stats;
+  RETURN_NOT_OK(metadata_->Flush(&orphan_stats));
+  UpdateOrphanBlockMetrics(orphan_stats);
+  return Status::OK();
 }
 
 // Computes on-disk size of all the deltas in provided rowsets.
@@ -2231,9 +2252,6 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompactionOrFlush &input,
                           "PostSwapInDuplicatingRowSet hook failed");
   }
 
-  // Store the stats on the max memory used for compaction phase 1.
-  const size_t peak_mem_usage_ph1 = merge->memory_footprint();
-
   // Phase 2. Here we re-scan the compaction input, copying those missed updates into the
   // new rowset's DeltaTracker.
   VLOG_WITH_PREFIX(1) << Substitute("$0: Phase 2: carrying over any updates "
@@ -2279,9 +2297,11 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompactionOrFlush &input,
   }
 
   // Write out the new Tablet Metadata and remove old rowsets.
-  RETURN_NOT_OK_PREPEND(FlushMetadata(input.rowsets(), new_drs_metas, mrs_being_flushed,
-                                      txns_being_flushed),
-                        "Failed to flush new tablet metadata");
+  {
+    RETURN_NOT_OK_PREPEND(FlushMetadata(input.rowsets(), new_drs_metas, mrs_being_flushed,
+                                        txns_being_flushed),
+                          "Failed to flush new tablet metadata");
+  }
 
   // Now that we've completed the operation, mark any rowsets that have been
   // compacted, preventing them from being considered for future compactions.
@@ -2294,8 +2314,13 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompactionOrFlush &input,
   AtomicSwapRowSets({ inprogress_rowset }, new_disk_rowsets);
   UpdateAverageRowsetHeight();
 
-  const size_t peak_mem_usage = std::max(peak_mem_usage_ph1,
-                                         merge->memory_footprint());
+  // Use the tracker's high-water mark as the authoritative peak memory figure.
+  // MergeCompactionInput::max_memory_usage_ (returned by merge->memory_footprint()) is
+  // sampled only at FinishBlock() time, after ProcessEmptyInputs() has already removed
+  // exhausted states so it consistently misses the true peak (when all DRS delta
+  // blocks are simultaneously resident after Init()). It also leaves out base-data arena
+  // and ApplyMutations arena contributions that the tracker does capture.
+  const size_t peak_mem_usage = static_cast<size_t>(tracker->peak_consumption());
   // For rowset merge compactions, update the stats on the max peak memory used
   // and ratio of the amount of memory used to the size of all deltas on disk.
   if (deltas_on_disk_size > 0) {
@@ -2345,11 +2370,13 @@ Status Tablet::HandleEmptyCompactionOrFlush(const RowSetVector& rowsets,
                                             int mrs_being_flushed,
                                             const vector<TxnInfoBeingFlushed>& txns_being_flushed) {
   // Write out the new Tablet Metadata and remove old rowsets.
-  RETURN_NOT_OK_PREPEND(FlushMetadata(rowsets,
-                                      RowSetMetadataVector(),
-                                      mrs_being_flushed,
-                                      txns_being_flushed),
-                        "Failed to flush new tablet metadata");
+  {
+    RETURN_NOT_OK_PREPEND(FlushMetadata(rowsets,
+                                        RowSetMetadataVector(),
+                                        mrs_being_flushed,
+                                        txns_being_flushed),
+                          "Failed to flush new tablet metadata");
+  }
 
   AtomicSwapRowSets(rowsets, RowSetVector());
   UpdateAverageRowsetHeight();
@@ -3255,7 +3282,7 @@ Status Tablet::DeleteAncientUndoDeltas(int64_t* blocks_deleted, int64_t* bytes_d
   // We flush the tablet metadata at the end because we don't flush per-RowSet
   // for performance reasons.
   if (tablet_blocks_deleted > 0) {
-    RETURN_NOT_OK(metadata_->Flush());
+    RETURN_NOT_OK(FlushTabletMetadataAndUpdateMetrics());
   }
 
   MonoDelta tablet_delete_duration = MonoTime::Now() - tablet_delete_start;

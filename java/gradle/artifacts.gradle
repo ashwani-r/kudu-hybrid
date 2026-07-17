@@ -51,7 +51,7 @@ task javadocJar(type: Jar, dependsOn: javadoc, group: "Build") {
 tasks.withType(Jar) {
   // Configure the manifest content of the Jars.
   manifest {
-    attributes "Implementation-Title": "$project.archivesBaseName"
+    attributes "Implementation-Title": "$project.name"
     attributes "Implementation-Version": "$project.version"
   }
   from ("$rootDir/../NOTICE.txt") {

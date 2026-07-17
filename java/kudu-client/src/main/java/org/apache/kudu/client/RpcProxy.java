@@ -121,7 +121,7 @@ class RpcProxy {
                           final Connection connection,
                           final KuduRpc<R> rpc) {
     counter(RPC_REQUESTS_METRIC, rpcTags(client, connection, rpc)).increment();
-    if (rpc.attempt > 1) {
+    if (rpc.getAttempt() > 1) {
       counter(RPC_RETRIES_METRIC, rpcTags(client, connection, rpc)).increment();
     }
     try {
@@ -209,7 +209,7 @@ class RpcProxy {
       }
       requestIdBuilder.setClientId(requestTracker.getClientId());
       requestIdBuilder.setSeqNo(rpc.getSequenceId());
-      requestIdBuilder.setAttemptNo(rpc.attempt);
+      requestIdBuilder.setAttemptNo(rpc.getAttempt());
       requestIdBuilder.setFirstIncompleteSeqNo(requestTracker.firstIncomplete());
       headerBuilder.setRequestId(requestIdBuilder);
     }

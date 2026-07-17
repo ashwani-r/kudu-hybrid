@@ -109,6 +109,22 @@
 #     This value can be important to set on resource constrained machines
 #     running some of the more intense long running integration tests.
 
+
+#
+# Special tags/labels for commit messages are described below. They modify
+# the behavior of this script. A tag/label must start a dedicated line in
+# the commit message, i.e. there shouldn't be any text after the tag/label
+# that starts such a special line in the commit message.
+#
+#   DONT_BUILD
+#     If 'KUDU_ALLOW_SKIPPED_TESTS' variable set to 1 AND this tag is present
+#     in the commit message, don't even start building -- exit early.
+#
+#   CLEAN_THIRDPARTY
+#     clean the thirdparty directory before the build and upon exiting,
+#     regardless of the exit status of this script
+#
+
 if [ "$KUDU_ALLOW_SKIPPED_TESTS" == "1" ]; then
   # If the commit only contains changes that do not impact the build or tests, exit immediately.
   # This check is conservative and attempts to have no false positives, but may have false negatives.
@@ -123,8 +139,7 @@ if [ "$KUDU_ALLOW_SKIPPED_TESTS" == "1" ]; then
   fi
 
   # If a commit messages contains a line that says 'DONT_BUILD', exit immediately.
-  DONT_BUILD=$(git show|egrep '^\s{4}DONT_BUILD$')
-  if [ "x$DONT_BUILD" != "x" ]; then
+  if git show -s --format=%B | egrep -q '^DONT_BUILD\s*$'; then
     echo
     echo ------------------------------------------------------------
     echo "*** Build not requested. Exiting."
@@ -206,16 +221,27 @@ list_flaky_tests() {
 TEST_LOGDIR="$BUILD_ROOT/test-logs"
 TEST_DEBUGDIR="$BUILD_ROOT/test-debug"
 
-cleanup() {
-  echo Cleaning up all build artifacts and temporary data...
-  $SOURCE_ROOT/build-support/jenkins/post-build-clean.sh
+clean_thirdparty_if_needed() {
+  if git show -s --format=%B | egrep -q '^CLEAN_THIRDPARTY\s*$'; then
+    echo "Found CLEAN_THIRDPARTY tag in the commit message: cleaning thirdparty"
+    git clean -xfd $THIRDPARTY_DIR
+  fi
 }
-# If we're running inside Jenkins (the BUILD_TAG is set), then install
-# an exit handler which will clean up all of our build results and temporary
-# data.
-if [ -n "$BUILD_TAG" ]; then
-  trap cleanup EXIT
-fi
+
+cleanup() {
+  # If we're running inside Jenkins (the BUILD_TAG is set), then install
+  # an exit handler which will clean up all of our build results and temporary
+  # data.
+  if [ -n "$BUILD_TAG" ]; then
+    echo Cleaning up all build artifacts and temporary data...
+    $SOURCE_ROOT/build-support/jenkins/post-build-clean.sh
+  fi
+  clean_thirdparty_if_needed
+}
+
+trap cleanup EXIT
+
+clean_thirdparty_if_needed
 
 ARTIFACT_ARCH=$(uname -m)
 # Configure the build
@@ -342,11 +368,33 @@ else
   CLANG=$THIRDPARTY_DIR/clang-toolchain/bin/clang
 fi
 
-# Make sure we use JDK8
+# Select JDK for the local build and dist-test workers.
+#
+# Priority (highest to lowest):
+#   1. JAVA8_HOME set in the environment  (explicit env override)
+#   2. Commit message contains 'JAVA8_OVERRIDE'  (per-commit override)
+#   3. JAVA17_HOME set in the environment  (default when image sets it)
+#   4. System default java
+#
+# In all cases KUDU_DIST_TEST_JAVA_VERSION is set to match so that
+# dist_test.py tells workers to use the same JDK version.
+if git log -1 --format=%B 2>/dev/null | grep -Eq '^JAVA8_OVERRIDE$'; then
+  echo "JAVA8_OVERRIDE found in commit message - using JDK 8"
+  # Commit message wins over JAVA17_HOME but loses to an explicit JAVA8_HOME.
+  : "${JAVA8_HOME:=/usr/lib/jvm/java-8-openjdk-amd64}"
+fi
+
 if [ -n "$JAVA8_HOME" ]; then
   export JAVA_HOME="$JAVA8_HOME"
   export PATH="$JAVA_HOME/bin:$PATH"
+  export KUDU_DIST_TEST_JAVA_VERSION="${KUDU_DIST_TEST_JAVA_VERSION:-8}"
+elif [ -n "$JAVA17_HOME" ]; then
+  export JAVA_HOME="$JAVA17_HOME"
+  export PATH="$JAVA_HOME/bin:$PATH"
+  export KUDU_DIST_TEST_JAVA_VERSION="${KUDU_DIST_TEST_JAVA_VERSION:-17}"
 fi
+# Default dist-test workers to JDK 17 when no explicit override is given.
+export KUDU_DIST_TEST_JAVA_VERSION="${KUDU_DIST_TEST_JAVA_VERSION:-17}"
 
 # Some portions of the C++ build may depend on Java code, so we may run Gradle
 # while building. Pass in some flags suitable for automated builds; these will
@@ -360,6 +408,11 @@ EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS --build-cache"
 # KUDU-2524: temporarily disable scalafmt until we can work out its JDK
 # incompatibility issue.
 EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -DskipFormat"
+# In coverage builds, pass -PgenerateCoverage so that quality.gradle wires
+# jacocoTestReport as a finalizer of the test task (runs even on test failure).
+if [ "$DO_COVERAGE" == "1" ]; then
+  EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS -PgenerateCoverage"
+fi
 EXTRA_GRADLE_FLAGS="$EXTRA_GRADLE_FLAGS $GRADLE_FLAGS"
 
 # Assemble the cmake command line, starting with environment variables.
@@ -610,14 +663,22 @@ if [ "$BUILD_JAVA" == "1" ]; then
     fi
   else
     if [ "$DO_COVERAGE" == "1" ]; then
-      # Clean previous report results
-      rm -rf ./build
-
-      # jacocoAggregatedReport will trigger test execution if necessary.
-      if ! ./gradlew $EXTRA_GRADLE_FLAGS clean jacocoAggregatedReport; then
+      # Step 1: run all tests.
+      # quality.gradle wires "test.finalizedBy jacocoTestReport" in coverage mode, so
+      # per-subproject .exec files and HTML/XML reports are written even when some tests
+      # fail. --continue (already in EXTRA_GRADLE_FLAGS) ensures every subproject runs.
+      if ! ./gradlew $EXTRA_GRADLE_FLAGS clean test; then
         TESTS_FAILED=1
+        FAILURES="$FAILURES"$'Java Gradle tests failed\n'
+      fi
+
+      # Step 2: aggregate coverage across all subprojects.
+      # jacocoTestReport tasks are UP-TO-DATE (already ran as finalizers in step 1) so
+      # tests are not re-executed. jacocoAggregatedReport simply merges the existing
+      # per-subproject reports.
+      if ! ./gradlew $EXTRA_GRADLE_FLAGS jacocoAggregatedReport; then
         EXIT_STATUS=1
-        FAILURES="$FAILURES"$'Java Gradle test/coverage aggregation failed\n'
+        FAILURES="$FAILURES"$'Java Jacoco aggregated report failed\n'
       fi
 
       if ! $SOURCE_ROOT/build-support/process_jacoco_report.sh; then
@@ -660,11 +721,11 @@ if [ "$BUILD_PYTHON" == "1" ]; then
 
   pip $PIP_FLAGS install $PIP_INSTALL_FLAGS -r requirements_dev.txt
 
-  # Delete old Cython extensions to force them to be rebuilt.
-  rm -Rf build kudu_python.egg-info kudu/*.so
-
-  # Build the Python bindings. This assumes we run this script from base dir.
-  CC=$CLANG CXX=$CLANG++ python setup.py build_ext
+  # Build and install the Python bindings (Cython is installed automatically via pyproject.toml).
+  # -e (editable) is required: plain 'pip install .' copies the source to a temp directory where
+  # python/version.txt (a symlink to ../version.txt) becomes a dangling symlink and setup.py fails.
+  # Editable installs build in-place in the source directory, so the symlink resolves correctly.
+  CC=$CLANG CXX=$CLANG++ pip install -e .
 
   # A testing environment might have HTTP/HTTPS proxy configured to proxy
   # requests even for 127.0.0.0/8 network or other quirks. Since some Python
@@ -679,8 +740,8 @@ if [ "$BUILD_PYTHON" == "1" ]; then
 
   # Run the Python tests. This may also involve some compiler work.
   set +e
-  if ! CC=$CLANG CXX=$CLANG++ python setup.py test \
-      --addopts="kudu --junit-xml=$TEST_LOGDIR/python_client.xml" \
+  if ! CC=$CLANG CXX=$CLANG++ python -m pytest kudu \
+      --junit-xml=$TEST_LOGDIR/python_client.xml \
       2> $TEST_LOGDIR/python_client.log ; then
     TESTS_FAILED=1
     FAILURES="$FAILURES"$'Python tests failed\n'
@@ -715,11 +776,11 @@ if [ "$BUILD_PYTHON3" == "1" ]; then
 
   pip $PIP_FLAGS install $PIP_INSTALL_FLAGS -r requirements_dev.txt
 
-  # Delete old Cython extensions to force them to be rebuilt.
-  rm -Rf build kudu_python.egg-info kudu/*.so
-
-  # Build the Python bindings. This assumes we run this script from base dir.
-  CC=$CLANG CXX=$CLANG++ python setup.py build_ext
+  # Build and install the Python bindings (Cython is installed automatically via pyproject.toml).
+  # -e (editable) is required: plain 'pip install .' copies the source to a temp directory where
+  # python/version.txt (a symlink to ../version.txt) becomes a dangling symlink and setup.py fails.
+  # Editable installs build in-place in the source directory, so the symlink resolves correctly.
+  CC=$CLANG CXX=$CLANG++ pip install -e .
   set +e
 
   # A testing environment might have HTTP/HTTPS proxy configured to proxy
@@ -734,8 +795,8 @@ if [ "$BUILD_PYTHON3" == "1" ]; then
   unset https_proxy
 
   # Run the Python tests. This may also involve some compiler work.
-  if ! CC=$CLANG CXX=$CLANG++ python setup.py test \
-      --addopts="kudu --junit-xml=$TEST_LOGDIR/python3_client.xml" \
+  if ! CC=$CLANG CXX=$CLANG++ python -m pytest kudu \
+      --junit-xml=$TEST_LOGDIR/python3_client.xml \
       2> $TEST_LOGDIR/python3_client.log ; then
     TESTS_FAILED=1
     FAILURES="$FAILURES"$'Python 3 tests failed\n'

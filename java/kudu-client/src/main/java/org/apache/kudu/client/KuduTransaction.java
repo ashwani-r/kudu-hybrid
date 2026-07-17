@@ -153,13 +153,16 @@ public class KuduTransaction implements AutoCloseable {
       "transaction is not open for this handle";
 
   private final AsyncKuduClient client;
-  private long txnId = AsyncKuduClient.INVALID_TXN_ID;
-  private int keepaliveMillis = 0;
-  private boolean keepaliveEnabled = true;
-  private boolean isInFlight = false;
+  private volatile long txnId = AsyncKuduClient.INVALID_TXN_ID;
+  private volatile int keepaliveMillis = 0;
+  private volatile boolean keepaliveEnabled = true;
+  private volatile boolean isInFlight = false;
   private final Object isInFlightSync = new Object();
   private Timeout keepaliveTaskHandle = null;
   private final Object keepaliveTaskHandleSync = new Object();
+  // Always accessed under 'isCommitStartedSync', which already provides
+  // visibility, so no 'volatile' is needed here (unlike the fields above,
+  // which have unguarded reads).
   private boolean isCommitStarted = false;
   private final Object isCommitStartedSync = new Object();
   private List<AsyncKuduSession> sessions = new ArrayList<>();
@@ -636,7 +639,7 @@ public class KuduTransaction implements AutoCloseable {
         rpc.errback(new NonRecoverableException(
             Status.Aborted("transaction was aborted")));
       } else {
-        rpc.attempt++;
+        rpc.nextAttempt();
         delayedIsTransactionCommitted(
             rpc,
             isTransactionCommittedCb(rpc),
@@ -707,7 +710,7 @@ public class KuduTransaction implements AutoCloseable {
     }
   }
 
-  void doStartKeepaliveHeartbeating() {
+  final void doStartKeepaliveHeartbeating() {
     Preconditions.checkState(keepaliveEnabled);
     Preconditions.checkArgument(txnId > AsyncKuduClient.INVALID_TXN_ID);
     synchronized (keepaliveTaskHandleSync) {

@@ -35,7 +35,7 @@ import java.util.List;
 
 import com.google.common.collect.ImmutableList;
 import org.hamcrest.CoreMatchers;
-import org.junit.Assert;
+import org.hamcrest.MatcherAssert;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -697,7 +697,7 @@ public class TestKuduSession {
             table, 1, true));
     assertTrue(resp.hasRowError());
     assertTrue(resp.getRowError().getErrorStatus().isImmutable());
-    Assert.assertThat(resp.getRowError().getErrorStatus().toString(),
+    MatcherAssert.assertThat(resp.getRowError().getErrorStatus().toString(),
             CoreMatchers.containsString("Immutable: UPDATE not allowed for " +
                     "immutable column: column5_i INT32 NULLABLE IMMUTABLE"));
 
@@ -742,7 +742,7 @@ public class TestKuduSession {
             table, 1, false));
     assertTrue(resp.hasRowError());
     assertTrue(resp.getRowError().getErrorStatus().isInvalidArgument());
-    Assert.assertThat(resp.getRowError().getErrorStatus().toString(),
+    MatcherAssert.assertThat(resp.getRowError().getErrorStatus().toString(),
         CoreMatchers.containsString("Invalid argument: No fields updated, " +
                 "key is: (int32 key=<redacted>)"));
 
@@ -812,7 +812,7 @@ public class TestKuduSession {
             table, 1, 3, true));
     assertTrue(resp.hasRowError());
     assertTrue(resp.getRowError().getErrorStatus().isImmutable());
-    Assert.assertThat(resp.getRowError().getErrorStatus().toString(),
+    MatcherAssert.assertThat(resp.getRowError().getErrorStatus().toString(),
         CoreMatchers.containsString("Immutable: UPDATE not allowed for " +
                 "immutable column: column5_i INT32 NULLABLE IMMUTABLE"));
 

@@ -220,18 +220,21 @@ TEST_F(SpnegoRestCatalogTest, TestInvalidHeaders) {
   string table_id;
   ASSERT_OK(GetTableId(kTableName, &table_id));
   EasyCurl c;
+  c.set_return_headers(true);
   faststring buf;
   Status s = c.FetchURL(
       Substitute("http://$0/api/v1/tables", cluster_->mini_master()->bound_http_addr().ToString()),
       &buf,
       {"Authorization: I am an invalid header"});
-  ASSERT_STR_CONTAINS(s.ToString(), "HTTP 500");
+  ASSERT_STR_CONTAINS(s.ToString(), "HTTP 401");
+  ASSERT_STR_CONTAINS(buf.ToString(), "WWW-Authenticate: Negotiate");
 
   s = c.FetchURL(
       Substitute("http://$0/api/v1/tables", cluster_->mini_master()->bound_http_addr().ToString()),
       &buf,
       {"Authorization: Negotiate I am also an invalid header"});
   ASSERT_STR_CONTAINS(s.ToString(), "HTTP 401");
+  ASSERT_STR_CONTAINS(buf.ToString(), "WWW-Authenticate: Negotiate");
 }
 
 // The following tests are skipped on macOS due to inconsistent behavior of SPNEGO.

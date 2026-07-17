@@ -191,7 +191,8 @@ class TableLocationsCache {
 
     LOG.debug("Discovered table locations:\t{}", newEntries);
 
-    rwl.writeLock().lock();
+    ReentrantReadWriteLock.WriteLock writeLock = rwl.writeLock();
+    writeLock.lock();
     try {
       // Remove all existing overlapping entries, and add the new entries.
       Map.Entry<byte[], Entry> floorEntry = entries.floorEntry(discoveredlowerBound);
@@ -215,7 +216,7 @@ class TableLocationsCache {
         entries.put(entry.getLowerBoundPartitionKey(), entry);
       }
     } finally {
-      rwl.writeLock().unlock();
+      writeLock.unlock();
     }
   }
 

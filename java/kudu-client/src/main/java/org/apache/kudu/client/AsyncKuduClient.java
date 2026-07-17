@@ -1046,7 +1046,7 @@ public class AsyncKuduClient implements AutoCloseable {
 
     // We have no authn data -- connect to the master, which will fetch
     // new info.
-    fakeRpc.attempt++;
+    fakeRpc.nextAttempt();
     getMasterTableLocationsPB(null)
         .addCallback(new MasterLookupCB(masterTable,
                                         /* partitionKey */ null,
@@ -1099,7 +1099,7 @@ public class AsyncKuduClient implements AutoCloseable {
     }
 
     // We have no Metastore config -- connect to the master, which will fetch new info.
-    fakeRpc.attempt++;
+    fakeRpc.nextAttempt();
     getMasterTableLocationsPB(null)
         .addCallback(new MasterLookupCB(masterTable,
                                         /* partitionKey */ null,
@@ -1324,7 +1324,7 @@ public class AsyncKuduClient implements AutoCloseable {
     KuduRpc<AsyncKuduScanner.Response> nextRequest = scanner.getNextRowsRequest();
     // Important to increment the attempts before the next if statement since
     // getSleepTimeForRpc() relies on it if the client is null or dead.
-    nextRequest.attempt++;
+    nextRequest.nextAttempt();
     final ServerInfo info = tablet.getTabletServerByUuid(scanner.getTsUUID());
     if (info == null) {
       return delayedSendRpcToTablet(nextRequest, new RecoverableException(Status.RemoteError(
@@ -1357,7 +1357,7 @@ public class AsyncKuduClient implements AutoCloseable {
     }
 
     final Deferred<AsyncKuduScanner.Response> d = closeRequest.getDeferred();
-    closeRequest.attempt++;
+    closeRequest.nextAttempt();
     RpcProxy.sendRpc(this, connectionCache.getConnection(
         info, Connection.CredentialsPolicy.ANY_CREDENTIALS), closeRequest);
     return d;
@@ -1385,7 +1385,7 @@ public class AsyncKuduClient implements AutoCloseable {
     }
 
     final Deferred<Void> d = keepAliveRequest.getDeferred();
-    keepAliveRequest.attempt++;
+    keepAliveRequest.nextAttempt();
     RpcProxy.sendRpc(this, connectionCache.getConnection(
         info, Connection.CredentialsPolicy.ANY_CREDENTIALS), keepAliveRequest);
     return d;
@@ -1406,7 +1406,7 @@ public class AsyncKuduClient implements AutoCloseable {
     if (cannotRetryRequest(request)) {
       return tooManyAttemptsOrTimeout(request, null);
     }
-    request.attempt++;
+    request.nextAttempt();
     final String tableId = request.getTable().getTableId();
     byte[] partitionKey = request.partitionKey();
     TableLocationsCache.Entry entry = getTableLocationEntry(tableId, partitionKey);
@@ -1705,7 +1705,7 @@ public class AsyncKuduClient implements AutoCloseable {
       if (resp.isDone()) {
         rpc.callback(alterResp);
       } else {
-        rpc.attempt++;
+        rpc.nextAttempt();
         delayedIsAlterTableDone(
             table,
             rpc,
@@ -1738,7 +1738,7 @@ public class AsyncKuduClient implements AutoCloseable {
       if (resp.isDone()) {
         rpc.callback(tableResp);
       } else {
-        rpc.attempt++;
+        rpc.nextAttempt();
         delayedIsCreateTableDone(
             table,
             rpc,
@@ -1831,7 +1831,7 @@ public class AsyncKuduClient implements AutoCloseable {
   }
 
   long getSleepTimeForRpcMillis(KuduRpc<?> rpc) {
-    int attemptCount = rpc.attempt;
+    int attemptCount = rpc.getAttempt();
     if (attemptCount == 0) {
       // If this is the first RPC attempt, don't sleep at all.
       return 0;
@@ -1840,7 +1840,7 @@ public class AsyncKuduClient implements AutoCloseable {
     long sleepTime = (long)(Math.pow(2.0, Math.min(attemptCount, 12)) *
         sleepRandomizer.nextDouble());
     if (LOG.isTraceEnabled()) {
-      LOG.trace("Going to sleep for {} at retry {}", sleepTime, rpc.attempt);
+      LOG.trace("Going to sleep for {} at retry {}", sleepTime, rpc.getAttempt());
     }
     return sleepTime;
   }
@@ -1865,7 +1865,7 @@ public class AsyncKuduClient implements AutoCloseable {
    * {@code false} otherwise (in which case it's OK to retry once more)
    */
   private static boolean cannotRetryRequest(final KuduRpc<?> rpc) {
-    return rpc.timeoutTracker.timedOut() || rpc.attempt > MAX_RPC_ATTEMPTS;
+    return rpc.timeoutTracker.timedOut() || rpc.getAttempt() > MAX_RPC_ATTEMPTS;
   }
 
   /**
@@ -1878,7 +1878,7 @@ public class AsyncKuduClient implements AutoCloseable {
   static <R> Deferred<R> tooManyAttemptsOrTimeout(final KuduRpc<R> request,
                                                   final KuduException cause) {
     String message;
-    if (request.attempt > MAX_RPC_ATTEMPTS) {
+    if (request.getAttempt() > MAX_RPC_ATTEMPTS) {
       message = "too many attempts: ";
     } else {
       message = "cannot complete before timeout: ";
@@ -2058,9 +2058,9 @@ public class AsyncKuduClient implements AutoCloseable {
       final byte[] lookupKey = partitionKey;
 
       // Build a fake RPC to encapsulate and propagate the timeout. There's no actual "RPC" to send.
-      KuduRpc fakeRpc = buildFakeRpc("loopLocateTable",
-                                     null,
-                                     timeoutTracker.getMillisBeforeTimeout());
+      KuduRpc<?> fakeRpc = buildFakeRpc("loopLocateTable",
+                                        null,
+                                        timeoutTracker.getMillisBeforeTimeout());
 
       return locateTablet(table, key, fetchBatchSize, fakeRpc).addCallbackDeferring(
           new Callback<Deferred<List<LocatedTablet>>, GetTableLocationsResponsePB>() {
@@ -2192,9 +2192,9 @@ public class AsyncKuduClient implements AutoCloseable {
       for (LocatedTablet tablet : tablets) {
         // Build a fake RPC to encapsulate and propagate the timeout.
         // There's no actual "RPC" to send.
-        KuduRpc fakeRpc = buildFakeRpc("getTableKeyRanges",
-                                       null,
-                                       timeoutTracker.getMillisBeforeTimeout());
+        KuduRpc<?> fakeRpc = buildFakeRpc("getTableKeyRanges",
+                                          null,
+                                          timeoutTracker.getMillisBeforeTimeout());
         deferreds.add(getTabletKeyRanges(table,
                                          startPrimaryKey,
                                          endPrimaryKey,

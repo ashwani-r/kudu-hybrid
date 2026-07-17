@@ -68,6 +68,7 @@ else
     case $arg in
       # Dependency groups.
       "common")         F_COMMON=1 ;;
+      "client_only")    F_CLIENT_ONLY=1 ;;
       "uninstrumented") F_UNINSTRUMENTED=1 ;;
       "tsan")           F_TSAN=1 ;;
 
@@ -112,6 +113,7 @@ else
       "ranger-kms")   F_RANGER_KMS=1 ;;
       "rocksdb")      F_ROCKSDB=1 ;;
       "flatbuffers")  F_FLATBUFFERS=1 ;;
+      "prometheus")   F_PROMETHEUS=1 ;;
       *)              echo "Unknown module: $arg"; exit 1 ;;
     esac
   done
@@ -226,11 +228,11 @@ MODE_SUFFIX=""
 # Add tools to path
 export PATH=$PREFIX/bin:$PATH
 
-if [ -n "$F_COMMON" -o -n "$F_CMAKE" ]; then
+if [ -n "$F_COMMON" -o -n "$F_CLIENT_ONLY" -o -n "$F_CMAKE" ]; then
   build_cmake
 fi
 
-if [ -n "$F_COMMON" -o -n "$F_RAPIDJSON" ]; then
+if [ -n "$F_COMMON" -o -n "$F_CLIENT_ONLY" -o -n "$F_RAPIDJSON" ]; then
   build_rapidjson
 fi
 
@@ -246,7 +248,7 @@ if [ -n "$F_COMMON" -o -n "$F_TRACE_VIEWER" ]; then
   build_trace_viewer
 fi
 
-if [ -n "$F_COMMON" -o -n "$F_SPARSEHASH" ]; then
+if [ -n "$F_COMMON" -o -n "$F_CLIENT_ONLY" -o -n "$F_SPARSEHASH" ]; then
   build_sparsehash
 fi
 
@@ -308,8 +310,15 @@ if [ -n "$F_COMMON" -o -n "$F_RANGER_KMS" ]; then
 fi
 
 # Actual Kudu binaries only use the header-only part
-if [ -n "$F_COMMON" -o -n "$F_FLATBUFFERS" ]; then
+if [ -n "$F_COMMON" -o -n "$F_CLIENT_ONLY" -o -n "$F_FLATBUFFERS" ]; then
   build_flatbuffers
+fi
+
+# Install Prometheus by symlinking its prebuilt binary directory into $PREFIX/opt.
+# Prometheus is a Go binary and does not require compilation.
+if [ -n "$F_COMMON" -o -n "$F_PROMETHEUS" ]; then
+  mkdir -p $PREFIX/opt
+  ln -nsf $PROMETHEUS_SOURCE $PREFIX/opt/prometheus
 fi
 ### Build C dependencies without instrumentation
 
@@ -322,12 +331,13 @@ save_env
 EXTRA_CFLAGS="-g $EXTRA_CFLAGS"
 EXTRA_CXXFLAGS="-g $EXTRA_CXXFLAGS"
 
-if [ -n "$F_UNINSTRUMENTED" -o -n "$F_ZLIB" ]; then
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_CLIENT_ONLY" -o -n "$F_ZLIB" ]; then
   build_zlib
 fi
 
 # Put this after zlib to allow ARM builds to pick up compressed .debug_info support
-if [ -n "$OS_LINUX" ] && [ -n "$F_UNINSTRUMENTED" -o -n "$F_LIBUNWIND" ]; then
+if [ -n "$OS_LINUX" ] && \
+    [ -n "$F_UNINSTRUMENTED" -o -n "$F_CLIENT_ONLY" -o -n "$F_LIBUNWIND" ]; then
   build_libunwind
 fi
 
@@ -339,7 +349,7 @@ if [ -n "$F_UNINSTRUMENTED" -o -n "$F_BITSHUFFLE" ]; then
   build_bitshuffle
 fi
 
-if [ -n "$F_UNINSTRUMENTED" -o -n "$F_LIBEV" ]; then
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_CLIENT_ONLY" -o -n "$F_LIBEV" ]; then
   build_libev
 fi
 
@@ -387,24 +397,24 @@ if [ -n "$F_UNINSTRUMENTED" -o -n "$F_LLVM" ]; then
   build_libcxx normal
 fi
 
-if [ -n "$F_UNINSTRUMENTED" -o -n "$F_GFLAGS" ]; then
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_CLIENT_ONLY" -o -n "$F_GFLAGS" ]; then
   build_gflags
 fi
 
-if [ -n "$F_UNINSTRUMENTED" -o -n "$F_GLOG" ]; then
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_CLIENT_ONLY" -o -n "$F_GLOG" ]; then
   build_glog
 fi
 
-if [ -n "$F_UNINSTRUMENTED" -o -n "$F_GPERFTOOLS" ]; then
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_CLIENT_ONLY" -o -n "$F_GPERFTOOLS" ]; then
   build_gperftools
 fi
 
-if [ -n "$F_UNINSTRUMENTED" -o -n "$F_GMOCK" ]; then
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_CLIENT_ONLY" -o -n "$F_GMOCK" ]; then
   build_gmock_gtest
 fi
 
 
-if [ -n "$F_UNINSTRUMENTED" -o -n "$F_PROTOBUF" ]; then
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_CLIENT_ONLY" -o -n "$F_PROTOBUF" ]; then
   build_protobuf
 fi
 
@@ -412,12 +422,12 @@ if [ -n "$F_UNINSTRUMENTED" -o -n "$F_SNAPPY" ]; then
   build_snappy
 fi
 
-if [ -n "$F_UNINSTRUMENTED" -o -n "$F_CRCUTIL" ]; then
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_CLIENT_ONLY" -o -n "$F_CRCUTIL" ]; then
   build_crcutil
 fi
 
-if [ -n "$F_UNINSTRUMENTED" -o -n "$F_BOOST" ]; then
-  build_boost normal
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_CLIENT_ONLY" -o -n "$F_BOOST" ]; then
+  build_boost
 fi
 
 if [ -n "$F_UNINSTRUMENTED" -o -n "$F_MUSTACHE" ]; then
@@ -607,7 +617,7 @@ if [ -n "$F_TSAN" -o -n "$F_CRCUTIL" ]; then
 fi
 
 if [ -n "$F_TSAN" -o -n "$F_BOOST" ]; then
-  build_boost tsan
+  build_boost
 fi
 
 if [ -n "$F_TSAN" -o -n "$F_MUSTACHE" ]; then

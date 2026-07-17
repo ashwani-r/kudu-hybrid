@@ -32,11 +32,13 @@ dependencies {
 
   implementation libs.yetusAnnotations
 
+  compileOnly libs.annotations
+
   testImplementation project(path: ":kudu-test-utils", configuration: "shadow")
   testImplementation libs.junit
   testImplementation libs.log4jApi
   testImplementation libs.log4jCore
-  testImplementation libs.log4jSlf4jImpl
+  testImplementation libs.log4jSlf4j2Impl
   testImplementation libs.scalatest
 }
 
@@ -56,5 +58,4 @@ javadoc {
 
 // Skip publishing kudu-backup-common artifact because it will always be shaded into
 // kudu-backup and kudu-backup-tools.
-publish.enabled = false
-publishToMavenLocal.enabled = false
+disablePublishing()

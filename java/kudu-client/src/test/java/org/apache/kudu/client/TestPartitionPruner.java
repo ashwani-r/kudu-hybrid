@@ -64,6 +64,7 @@ public class TestPartitionPruner {
    * @deprecated we can remove it later, now just for test.
    * @return a bitset containing {@code false} bits for hash buckets which may be pruned
    */
+  @Deprecated
   private static BitSet pruneHashComponent(Schema schema,
                                            PartitionSchema.HashBucketSchema hashSchema,
                                            Map<String, KuduPredicate> predicates) {

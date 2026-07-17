@@ -25,9 +25,9 @@ import java.io.OutputStream;
 import java.io.RandomAccessFile;
 
 import com.google.common.annotations.VisibleForTesting;
-import org.apache.commons.cli.BasicParser;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
+import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.Option;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
@@ -38,7 +38,7 @@ import org.apache.yetus.audience.InterfaceAudience;
  * Utility class that manages common configurations to run a subprocess.
  */
 @InterfaceAudience.Private
-public class SubprocessConfiguration {
+public final class SubprocessConfiguration {
   private int queueSize;
   private static final int QUEUE_SIZE_DEFAULT = 100;
   private int maxMsgParserThreads;
@@ -155,7 +155,7 @@ public class SubprocessConfiguration {
     outputPipeOpt.setRequired(false);
     options.addOption(outputPipeOpt);
 
-    CommandLineParser parser = new BasicParser();
+    CommandLineParser parser = new DefaultParser();
     String outputPipePath;
     try {
       CommandLine cmd = parser.parse(options, args);

@@ -42,7 +42,7 @@ import org.apache.kudu.serdes.UInt8Array;
 /**
  * Lightweight view over a FlatBuffers Content blob representing a single array cell.
  */
-class ArrayCellView {
+final class ArrayCellView {
 
   private final byte[] rawBytes;
   private final Content content;

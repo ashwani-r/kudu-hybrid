@@ -697,6 +697,7 @@ public class TestKuduTable {
   }
 
   @Test(timeout = 100000)
+  @SuppressWarnings("deprecation")
   public void testCreateTableCustomHashSchemasTwoRanges() throws Exception {
     CreateTableOptions builder = getBasicCreateTableOptions();
 
@@ -891,6 +892,7 @@ public class TestKuduTable {
   }
 
   @Test(timeout = 100000)
+  @SuppressWarnings("deprecation")
   public void testCreateTableCustomHashSchemasTwoUnboundedRanges() throws Exception {
     CreateTableOptions builder = getBasicCreateTableOptions();
 
@@ -980,6 +982,7 @@ public class TestKuduTable {
   }
 
   @Test(timeout = 100000)
+  @SuppressWarnings("deprecation")
   public void testCreateTableCustomHashSchemasTwoMixedRanges() throws Exception {
     CreateTableOptions builder = getBasicCreateTableOptions();
 

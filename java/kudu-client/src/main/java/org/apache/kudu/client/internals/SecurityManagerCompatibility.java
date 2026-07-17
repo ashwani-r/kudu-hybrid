@@ -76,8 +76,7 @@ public interface SecurityManagerCompatibility {
    * @return the current subject, or {@code null} if a current subject is
    * not installed or the current subject is set to {@code null}.
    * @see #callAs(Subject, Callable)
-   * @see Subject#current()
-   * @see Subject#callAs(Subject, Callable)
+   * @see Subject
    */
   Subject current();
 
@@ -97,8 +96,7 @@ public interface SecurityManagerCompatibility {
    * The cause of the {@code CompletionException} is set to the exception
    * thrown by {@code action.call()}.
    * @see #current()
-   * @see Subject#current()
-   * @see Subject#callAs(Subject, Callable)
+   * @see Subject
    */
   <T> T callAs(Subject subject, Callable<T> action)
       throws CompletionException;

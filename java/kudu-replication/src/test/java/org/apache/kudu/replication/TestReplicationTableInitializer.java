@@ -57,7 +57,7 @@ public class TestReplicationTableInitializer extends ReplicationTestBase {
     createAllTypesTable(sourceClient);
     insertRowsIntoAllTypesTable(sourceClient, 0, 10);
 
-    envProvider.getEnv().executeAsync();
+    executeReplicationJobAsync();
 
     KuduTable sinkTable = sinkClient.openTable(TABLE_NAME);
     assertEventuallyTrue("Initial 10 rows should be replicated",
@@ -78,7 +78,7 @@ public class TestReplicationTableInitializer extends ReplicationTestBase {
     sourceClient.createTable(TABLE_NAME, schema, options);
     insertTestRows(sourceClient, 0, 10);
 
-    envProvider.getEnv().executeAsync();
+    executeReplicationJobAsync();
 
     KuduTable sinkTable = sinkClient.openTable(TABLE_NAME);
     assertEventuallyTrue("Hash partitioned table should be replicated",
@@ -107,7 +107,7 @@ public class TestReplicationTableInitializer extends ReplicationTestBase {
     sourceClient.createTable(TABLE_NAME, schema, options);
     insertTestRows(sourceClient, 0, 15);
 
-    envProvider.getEnv().executeAsync();
+    executeReplicationJobAsync();
 
     KuduTable sinkTable = sinkClient.openTable(TABLE_NAME);
     assertEventuallyTrue("Range partitioned table should be replicated",
@@ -137,7 +137,7 @@ public class TestReplicationTableInitializer extends ReplicationTestBase {
     sourceClient.createTable(TABLE_NAME, schema, options);
     insertTestRows(sourceClient, 0, 12);
 
-    envProvider.getEnv().executeAsync();
+    executeReplicationJobAsync();
 
     KuduTable sinkTable = sinkClient.openTable(TABLE_NAME);
     assertEventuallyTrue("Hash+range partitioned table should be replicated",
@@ -173,7 +173,7 @@ public class TestReplicationTableInitializer extends ReplicationTestBase {
     sourceClient.createTable(TABLE_NAME, schema, options);
     insertTestRows(sourceClient, 100, 10);
 
-    envProvider.getEnv().executeAsync();
+    executeReplicationJobAsync();
 
     KuduTable sinkTable = sinkClient.openTable(TABLE_NAME);
     assertEventuallyTrue("Custom hash schema table should be replicated",
@@ -208,7 +208,7 @@ public class TestReplicationTableInitializer extends ReplicationTestBase {
     insertTestRows(sourceClient, 0, 5);
     insertTestRows(sourceClient, 100, 5);
 
-    envProvider.getEnv().executeAsync();
+    executeReplicationJobAsync();
 
     KuduTable sinkTable = sinkClient.openTable(TABLE_NAME);
     assertEventuallyTrue("Non-covered range table should be replicated",
@@ -228,7 +228,7 @@ public class TestReplicationTableInitializer extends ReplicationTestBase {
     sourceClient.createTable(TABLE_NAME, schema, options);
     insertTestRows(sourceClient, 0, 8);
 
-    envProvider.getEnv().executeAsync();
+    executeReplicationJobAsync();
 
     KuduTable sinkTable = sinkClient.openTable(TABLE_NAME);
     assertEventuallyTrue("Unpartitioned table should be replicated",

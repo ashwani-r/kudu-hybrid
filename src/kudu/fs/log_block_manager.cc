@@ -22,6 +22,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <iterator>
 #include <map>
@@ -70,11 +71,13 @@
 #include "kudu/util/atomic-utils.h"
 #include "kudu/util/array_view.h"
 #include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/file_cache.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/flag_validators.h"
 #include "kudu/util/locks.h"
+#include "kudu/util/logging.h"
 #include "kudu/util/malloc.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/path_util.h"
@@ -128,6 +131,12 @@ DEFINE_uint64(log_container_rdb_delete_batch_count, 256,
               "effective when --block_manager='logr'");
 TAG_FLAG(log_container_rdb_delete_batch_count, experimental);
 TAG_FLAG(log_container_rdb_delete_batch_count, advanced);
+
+DEFINE_uint32(log_container_rdb_delete_fail_after_n_batches_for_tests, 0,
+             "For testing purpose only. 0 disables error injection. If the value is non-zero, "
+             "LogBlockContainerRdbMeta::RemoveBlockIdsFromMetadata() injects a write failure "
+             "before the (n+1)th batch write, after n batches have been committed.");
+TAG_FLAG(log_container_rdb_delete_fail_after_n_batches_for_tests, hidden);
 #endif
 
 DEFINE_double(log_container_excess_space_before_cleanup_fraction, 0.10,
@@ -155,6 +164,27 @@ DEFINE_double(log_container_metadata_size_before_compact_ratio, 0.80,
 TAG_FLAG(log_container_metadata_size_before_compact_ratio, advanced);
 TAG_FLAG(log_container_metadata_size_before_compact_ratio, experimental);
 
+DEFINE_uint64(log_container_metadata_inmem_replay_threshold_bytes,
+              64ULL * 1024 * 1024,
+              "When loading a log block container's metadata file at startup, if the "
+              "file's payload size (excluding any encryption header) is less than or "
+              "equal to this many bytes, the entire file will be slurped into memory "
+              "in a single read and replayed from the in-memory buffer instead of "
+              "issuing two preadv() syscalls per record (one for the length+checksum "
+              "prefix and one for the body+checksum). This trades a small transient memory "
+              "spike per concurrently-loading container for a large reduction in the "
+              "number of syscalls performed during 'Reading filesystem' at startup. "
+              "Set to 0 to disable and always use the streaming code path. Only "
+              "applies to --block_manager='log' (native metadata). For encrypted "
+              "metadata the buffer holds the ciphertext payload and small per-record "
+              "decryption is performed on each in-memory Read(); the threshold is "
+              "compared against the cleartext payload size in both cases, so the "
+              "same flag value applies uniformly to encrypted and non-encrypted "
+              "clusters.");
+TAG_FLAG(log_container_metadata_inmem_replay_threshold_bytes, advanced);
+TAG_FLAG(log_container_metadata_inmem_replay_threshold_bytes, experimental);
+TAG_FLAG(log_container_metadata_inmem_replay_threshold_bytes, runtime);
+
 DEFINE_bool(log_block_manager_test_hole_punching, true,
             "Ensure hole punching is supported by the underlying filesystem");
 TAG_FLAG(log_block_manager_test_hole_punching, advanced);
@@ -171,6 +201,12 @@ DEFINE_int32(log_container_metadata_rewrite_inject_latency_ms, 0,
              "Amount of latency in ms to inject when rewrite metadata file. "
              "Only for testing.");
 TAG_FLAG(log_container_metadata_rewrite_inject_latency_ms, hidden);
+
+DEFINE_int32(log_block_manager_inject_latency_load_container_ms, 0,
+             "Amount of latency in ms to inject when loading a container "
+             "during Open(). Only for testing.");
+TAG_FLAG(log_block_manager_inject_latency_load_container_ms, hidden);
+TAG_FLAG(log_block_manager_inject_latency_load_container_ms, unsafe);
 
 METRIC_DEFINE_gauge_uint64(server, log_block_manager_bytes_under_management,
                            "Bytes Under Management",
@@ -1383,6 +1419,234 @@ Status LogBlockContainer::TruncateDataToNextBlockOffset() {
   return Status::OK();
 }
 
+namespace {
+
+// A RandomAccessFile implementation that serves all reads from an in-memory
+// buffer holding the entire contents of a metadata file.
+//
+// This wrapper is intended as a drop-in replacement for the file handle passed
+// to ReadablePBContainerFile when loading a log block container's metadata
+// file at startup: by slurping the whole file once and then satisfying every
+// subsequent ReadablePBContainerFile preadv() from memory, we eliminate the
+// per-record syscall.
+//
+// Encrypted files are supported transparently: the buffer holds the raw
+// ciphertext bytes that follow the encryption header (offsets in the buffer
+// are therefore "logical_offset - header_size"), and per-Read()/-ReadV() we
+// forward to the underlying RandomAccessFile's Decrypt() to recover plaintext
+// on a per-slice basis. This preserves the per-slice IsAllZeros() short-circuit
+// that streaming-mode pb_util relies on for KUDU-2260 trailing-zero recovery:
+// for an unencrypted file Decrypt() is a no-op, and for an encrypted file the
+// slices handed to Decrypt() are exactly the ones the caller originally
+// requested (typically small length+cksum / body+cksum chunks for pb_util),
+// not a single bulk slice.
+//
+// The instance is immutable after construction and therefore trivially
+// thread-safe, matching RandomAccessFile's contract.
+class MemoryReadableFile : public RandomAccessFile {
+ public:
+  MemoryReadableFile(string filename,
+                     faststring data,
+                     size_t encryption_header_size,
+                     shared_ptr<RandomAccessFile> source)
+      : filename_(std::move(filename)),
+        encryption_header_size_(encryption_header_size),
+        data_(std::move(data)),
+        file_size_(encryption_header_size_ + data_.size()),
+        source_(std::move(source)) {
+    // 'source_' is present iff the file has an encryption header.
+    DCHECK_EQ(encryption_header_size_ > 0, static_cast<bool>(source_));
+  }
+
+  Status Read(uint64_t offset, Slice result) const override {
+    // Reject offsets inside the encryption header in release builds too: the
+    // unsigned 'offset - encryption_header_size_' below would otherwise wrap.
+    // The EOF check is written as 'result.size() > file_size_ - offset'
+    // rather than 'offset + result.size() > file_size_' so the comparison
+    // itself is overflow-safe for hostile inputs (the 'offset > file_size_'
+    // clause guards the subtraction).
+    if (PREDICT_FALSE(offset < encryption_header_size_ ||
+                      offset > file_size_ ||
+                      result.size() > file_size_ - offset)) {
+      return Status::IOError(
+          Substitute("out-of-bounds in-memory read in $0: "
+                     "offset=$1 size=$2 file_size=$3",
+                     filename_, offset, result.size(), file_size_));
+    }
+    const uint64_t buf_offset = offset - encryption_header_size_;
+    memcpy(result.mutable_data(), data_.data() + buf_offset, result.size());
+    if (!source_) {
+      // Unencrypted: data_ already holds plaintext, no Decrypt() needed.
+      return Status::OK();
+    }
+    return source_->Decrypt(offset, ArrayView<Slice>(&result, 1));
+  }
+
+  Status ReadV(uint64_t offset, ArrayView<Slice> results) const override {
+    // 'offset' only grows below, so once we know the first slice is past
+    // the encryption header all subsequent slices are too.
+    if (PREDICT_FALSE(offset < encryption_header_size_)) {
+      return Status::IOError(
+          Substitute("out-of-bounds in-memory read in $0: "
+                     "offset=$1 < encryption_header=$2 file_size=$3",
+                     filename_, offset, encryption_header_size_, file_size_));
+    }
+    const uint64_t orig_offset = offset;
+    for (auto& s : results) {
+      // Same overflow-safe EOF check as Read() above.
+      if (PREDICT_FALSE(offset > file_size_ ||
+                        s.size() > file_size_ - offset)) {
+        return Status::IOError(
+            Substitute("out-of-bounds in-memory read in $0: "
+                       "offset=$1 size=$2 file_size=$3",
+                       filename_, offset, s.size(), file_size_));
+      }
+      const uint64_t buf_offset = offset - encryption_header_size_;
+      memcpy(s.mutable_data(), data_.data() + buf_offset, s.size());
+      offset += s.size();
+    }
+    if (!source_) {
+      return Status::OK();
+    }
+    // Decrypt the whole vector in one call so the underlying impl can amortize
+    // any per-call setup (cipher context init, IV seed). This is safe for
+    // pb_util's current usage (single-slice Read()s) but, as documented on
+    // RandomAccessFile::Decrypt(), is not equivalent to per-slice decryption
+    // when an *interior* slice is all-zero ciphertext.
+    return source_->Decrypt(orig_offset, results);
+  }
+
+  // The new RandomAccessFile virtuals must mirror the underlying file's
+  // semantics, even though the in-memory replay path doesn't call them today:
+  // the wrapper is otherwise indistinguishable from a real RandomAccessFile
+  // and a future caller could reasonably expect ReadRaw() to return
+  // ciphertext and Decrypt() to decrypt it. Forwarding to 'source_' preserves
+  // both contracts without an extra in-memory bookkeeping path.
+  Status ReadRaw(uint64_t raw_offset, Slice result) const override {
+    if (!source_) {
+      return Read(raw_offset, result);
+    }
+    return source_->ReadRaw(raw_offset, result);
+  }
+
+  Status Decrypt(uint64_t logical_offset,
+                 ArrayView<Slice> data) const override {
+    if (!source_) {
+      return Status::OK();
+    }
+    return source_->Decrypt(logical_offset, data);
+  }
+
+  Status Size(uint64_t* size) const override {
+    // Mirrors PosixRandomAccessFile::Size(), which returns the raw on-disk
+    // size including any encryption header. ReadablePBContainerFile (and any
+    // other caller that mixes Size() with the GetEncryptionHeaderSize() offset
+    // convention) depends on this.
+    *size = file_size_;
+    return Status::OK();
+  }
+
+  const string& filename() const override { return filename_; }
+
+  size_t memory_footprint() const override {
+    return sizeof(*this) + data_.capacity() + filename_.capacity();
+  }
+
+  size_t GetEncryptionHeaderSize() const override {
+    return encryption_header_size_;
+  }
+
+ private:
+  const string filename_;
+  const size_t encryption_header_size_;
+  const faststring data_;
+  // Cached 'encryption_header_size_ + data_.size()'. Used both to satisfy
+  // Size() (which returns the raw on-disk size including the header) and to
+  // power the overflow-free bounds checks in Read()/ReadV(), without
+  // recomputing the sum on every call.
+  const uint64_t file_size_;
+  // Kept alive solely so that Decrypt() can run against the original file's
+  // encryption header (key/IV). No further disk I/O is performed against it
+  // after the preload completes. Null for unencrypted files, where the
+  // underlying fd is released as soon as the buffer is slurped.
+  const shared_ptr<RandomAccessFile> source_;
+};
+
+// If the metadata file pointed to by 'raw_reader' is small enough (per
+// --log_container_metadata_inmem_replay_threshold_bytes, measured against the
+// cleartext payload size, i.e. excluding any encryption header), slurp it
+// entirely into memory and return a MemoryReadableFile wrapping it. Otherwise
+// (or on any I/O error during the preload) return 'raw_reader' unchanged so
+// the caller falls back to streaming reads.
+unique_ptr<RandomAccessFile> MaybePreloadMetadataIntoMemory(
+    const string& metadata_path,
+    unique_ptr<RandomAccessFile> raw_reader) {
+  const uint64_t threshold =
+      FLAGS_log_container_metadata_inmem_replay_threshold_bytes;
+  if (threshold == 0) {
+    return raw_reader;
+  }
+
+  const size_t header_size = raw_reader->GetEncryptionHeaderSize();
+  uint64_t raw_file_size = 0;
+  Status s = raw_reader->Size(&raw_file_size);
+  if (PREDICT_FALSE(!s.ok())) {
+    KLOG_EVERY_N_SECS(WARNING, 10)
+        << "Failed to stat metadata file " << metadata_path
+        << " for in-memory replay; falling back to streaming reads: "
+        << s.ToString();
+    return raw_reader;
+  }
+  if (PREDICT_FALSE(raw_file_size < header_size)) {
+    // Should be impossible: a valid encrypted file always contains at least
+    // its header. Fall back to streaming and let the normal open-time checks
+    // surface the corruption.
+    KLOG_EVERY_N_SECS(WARNING, 10)
+        << "Metadata file " << metadata_path << " is smaller ("
+        << raw_file_size << " bytes) than its declared encryption header ("
+        << header_size << " bytes); falling back to streaming reads";
+    return raw_reader;
+  }
+  const uint64_t payload_size = raw_file_size - header_size;
+  if (payload_size == 0) {
+    // Empty payload: there's nothing to preload, and the streaming path will
+    // detect EOF immediately after reading the (encryption + container)
+    // headers.
+    return raw_reader;
+  }
+  if (payload_size > threshold) {
+    return raw_reader;
+  }
+
+  faststring buf;
+  buf.resize(payload_size);
+  // ReadRaw() bypasses on-the-fly decryption: for encrypted files we
+  // intentionally cache the ciphertext, so that subsequent in-memory reads can
+  // forward small slices through source_->Decrypt() and keep pb_util's
+  // per-slice all-zero recovery semantics intact (see KUDU-2260, and the
+  // class comment on MemoryReadableFile).
+  s = raw_reader->ReadRaw(/*raw_offset=*/header_size,
+                          Slice(buf.data(), payload_size));
+  if (PREDICT_FALSE(!s.ok())) {
+    KLOG_EVERY_N_SECS(WARNING, 10)
+        << "Failed to preload metadata file " << metadata_path
+        << " (" << payload_size << " payload bytes) for in-memory replay; "
+        << "falling back to streaming reads: " << s.ToString();
+    return raw_reader;
+  }
+  VLOG(1) << "Preloaded metadata file " << metadata_path
+          << " (" << payload_size << " payload bytes, "
+          << header_size << " header bytes) for in-memory replay";
+  shared_ptr<RandomAccessFile> source;
+  if (header_size > 0) {
+    source = std::move(raw_reader);
+  }
+  return std::unique_ptr<RandomAccessFile>(new MemoryReadableFile(
+      metadata_path, std::move(buf), header_size, std::move(source)));
+}
+
+} // anonymous namespace
+
 Status LogBlockContainerNativeMeta::ProcessRecords(
     FsReport* report,
     LogBlockManager::UntrackedBlockMap* live_blocks,
@@ -1390,13 +1654,20 @@ Status LogBlockContainerNativeMeta::ProcessRecords(
     vector<LogBlockRefPtr>* dead_blocks,
     uint64_t* max_block_id,
     ProcessRecordType type) {
-  string metadata_path = metadata_file_->filename();
-  unique_ptr<RandomAccessFile> metadata_reader;
+  const string metadata_path = metadata_file_->filename();
+  unique_ptr<RandomAccessFile> raw_reader;
   RandomAccessFileOptions opts;
   opts.is_sensitive = true;
   RETURN_NOT_OK_HANDLE_ERROR(block_manager()->env()->NewRandomAccessFile(
-      opts, metadata_path, &metadata_reader));
-  ReadablePBContainerFile pb_reader(std::move(metadata_reader));
+      opts, metadata_path, &raw_reader));
+
+  // Attempt to preload the entire metadata file into memory so that the
+  // subsequent ReadablePBContainerFile reads (2 preadv()s/record) are all
+  // satisfied from memory. Falls back to streaming on any failure or when the
+  // file exceeds the configured threshold.
+  unique_ptr<RandomAccessFile> reader =
+      MaybePreloadMetadataIntoMemory(metadata_path, std::move(raw_reader));
+  ReadablePBContainerFile pb_reader(std::move(reader));
   RETURN_NOT_OK_HANDLE_ERROR(pb_reader.Open());
 
   uint64_t data_file_size = 0;
@@ -2115,11 +2386,20 @@ Status LogBlockContainerRdbMeta::RemoveBlockIdsFromMetadata(
   // Note: We don't check for sufficient disk space for metadata writes in
   // order to allow for block deletion on full disks.
   DCHECK(deleted_block_ids);
+  deleted_block_ids->reserve(lbs.size());
+
+  size_t committed_count = 0;
+  SCOPED_CLEANUP({
+    // Keep only those block IDs that were successfully deleted.
+    deleted_block_ids->resize(committed_count);
+  });
+
   // Perform batch delete has a better performance than single deletes.
   rocksdb::WriteBatch batch;
   // The 'keys' is used to keep the lifetime of the data referenced by Slices in 'batch'.
   vector<string> keys;
   keys.reserve(lbs.size());
+  uint32_t write_count = 0;
   for (const auto& lb : lbs) {
     deleted_block_ids->emplace_back(lb->block_id());
 
@@ -2131,14 +2411,28 @@ Status LogBlockContainerRdbMeta::RemoveBlockIdsFromMetadata(
 
     // Tune --log_container_rdb_delete_batch_count to achieve better performance.
     if (batch.Count() >= FLAGS_log_container_rdb_delete_batch_count) {
+      if (PREDICT_FALSE(FLAGS_log_container_rdb_delete_fail_after_n_batches_for_tests > 0 &&
+          write_count >= FLAGS_log_container_rdb_delete_fail_after_n_batches_for_tests)) {
+        RETURN_NOT_OK_HANDLE_ERROR(Status::IOError("Injected failure for testing"));
+      }
+      int batch_count = batch.Count();
       RETURN_NOT_OK_HANDLE_ERROR(FromRdbStatus(rdb_->Write({}, &batch)));
+      committed_count += batch_count;
+      write_count++;
       batch.Clear();
       keys.clear();
     }
   }
 
   if (batch.Count() > 0) {
+    if (PREDICT_FALSE(FLAGS_log_container_rdb_delete_fail_after_n_batches_for_tests > 0 &&
+        write_count >= FLAGS_log_container_rdb_delete_fail_after_n_batches_for_tests)) {
+      RETURN_NOT_OK_HANDLE_ERROR(Status::IOError("Injected failure for testing"));
+    }
+    int batch_count = batch.Count();
     RETURN_NOT_OK_HANDLE_ERROR(FromRdbStatus(rdb_->Write({}, &batch)));
+    committed_count += batch_count;
+    write_count++;
   }
 
   return Status::OK();
@@ -3322,6 +3616,7 @@ Status LogBlockManager::RemoveLogBlocks(const vector<BlockId>& block_ids,
     lbs_by_container.emplace_back(std::move(lb));
   }
 
+  size_t total_orphaned_count = 0;
   for (auto& [container, clbs] : lbs_by_containers) {
     for (const auto& lb : clbs) {
       VLOG(3) << "Deleting block " << lb->block_id();
@@ -3340,14 +3635,33 @@ Status LogBlockManager::RemoveLogBlocks(const vector<BlockId>& block_ids,
     // fsync).
     //
     // TODO(KUDU-829): Implement GC of orphaned blocks.
-    // TODO(yingchun): Add some metrics to track the number of orphaned blocks.
     if (s.ok()) {
       container->PostWorkOfBlocksDeleted();
     } else {
       if (first_failure.ok()) {
         first_failure = s.CloneAndPrepend("Unable to append deletion record(s) to block metadata");
       }
-      // Purge the blocks that failed to delete.
+      // Blocks whose deletion metadata could not be written are permanently
+      // orphaned i.e., their data occupies space on disk. They will not be cleaned
+      // up automatically and may cause unreclaimed disk space accumulation over time.
+      // RemoveBlockIdsFromMetadata writes records in the same order as clbs,
+      // so deleted_block_ids.size() is the index of the first failure: the
+      // failed blocks form a contiguous suffix of clbs.
+      const size_t orphaned_count =
+          clbs.size() - deleted_block_ids.size();
+      for (auto it = clbs.cbegin() + deleted_block_ids.size(); it != clbs.cend(); ++it) {
+        KLOG_EVERY_N_SECS(ERROR, 1) << Substitute(
+            "Block $0 in container $1 is now orphaned (failed to commit deletion record): $2, "
+            "with unreclaimed disk space left behind. Run 'kudu fs check --repair' to reclaim it.",
+            (*it)->block_id().ToString(), container->ToString(), s.ToString()) << THROTTLE_MSG;
+      }
+      KLOG_EVERY_N_SECS(ERROR, 1) << Substitute(
+          "$0 block(s) in container $1 are now orphaned (failed to commit "
+          "deletion records): $2, with unreclaimed disk space left behind. "
+          "Run 'kudu fs check --repair' to reclaim it.",
+          orphaned_count, container->ToString(), s.ToString()) << THROTTLE_MSG;
+      total_orphaned_count += orphaned_count;
+      // Purge the blocks that failed to delete from the current batch.
       clbs.resize(deleted_block_ids.size());
     }
 
@@ -3355,6 +3669,13 @@ Status LogBlockManager::RemoveLogBlocks(const vector<BlockId>& block_ids,
       std::move(deleted_block_ids.begin(), deleted_block_ids.end(), std::back_inserter(*deleted));
     }
     std::move(clbs.begin(), clbs.end(), std::back_inserter(*log_blocks));
+  }
+
+  if (total_orphaned_count > 0) {
+    LOG(ERROR) << Substitute(
+        "$0 block(s) across $1 container(s) are now orphaned with unreclaimed "
+        "disk space. Run 'kudu fs check --repair' to reclaim it.",
+        total_orphaned_count, lbs_by_containers.size());
   }
 
   return first_failure;
@@ -3391,8 +3712,8 @@ Status LogBlockManager::RemoveLogBlock(const BlockId& block_id,
     int uuid_idx;
     CHECK(dd_manager_->FindUuidIndexByDir(container->data_dir(), &uuid_idx));
     if (ContainsKey(failed_dirs, uuid_idx)) {
-      LOG_EVERY_N(INFO, 10) << Substitute("Block $0 is in a failed directory; not deleting",
-                                          block_id.ToString());
+      KLOG_EVERY_N(INFO, 10) << Substitute("Block $0 is in a failed directory; not deleting",
+                                           block_id.ToString());
       return Status::IOError("Block is in a failed directory");
     }
   }
@@ -3446,13 +3767,15 @@ void LogBlockManager::OpenDataDir(
     results->emplace_back(new internal::LogBlockContainerLoadResult());
     LogBlockContainerRefPtr container;
     s = OpenContainer(dir, &results->back()->report, container_name, &container);
-    if (containers_processed) {
-      ++*containers_processed;
-      if (metrics_) {
-        metrics()->processed_containers_startup->Increment();
-      }
-    }
     if (!s.ok()) {
+      // Even if the container failed to open, count it as processed so progress
+      // tracking doesn't stall.
+      if (containers_processed) {
+        ++*containers_processed;
+        if (metrics_) {
+          metrics()->processed_containers_startup->Increment();
+        }
+      }
       if (s.IsAborted()) {
         // Skip the container. Open() added a record of it to 'results->back()->report' for us.
         continue;
@@ -3468,9 +3791,24 @@ void LogBlockManager::OpenDataDir(
     }
 
     // Load the container's records asynchronously.
+    // Increment containers_processed after LoadContainer completes so that
+    // the progress counter reflects containers that have been fully loaded
+    // (metadata records read and processed), not just containers whose file
+    // handles have been opened.
+    //
+    // Note: 'containers_processed' is guaranteed to outlive this closure
+    // because LogBlockManager::Open() (the caller of OpenDataDir()) blocks on
+    // dd_manager_->WaitOnClosures() before returning, so the pointer remains
+    // valid for the entire duration of this background task.
     auto* r = results->back().get();
-    dir->ExecClosure([this, dir, container, r]() {
+    dir->ExecClosure([this, dir, container, r, containers_processed]() {
       this->LoadContainer(dir, container, r);
+      if (containers_processed) {
+        ++*containers_processed;
+        if (metrics_) {
+          metrics()->processed_containers_startup->Increment();
+        }
+      }
     });
   }
 }
@@ -3478,6 +3816,7 @@ void LogBlockManager::OpenDataDir(
 void LogBlockManager::LoadContainer(Dir* dir,
                                     LogBlockContainerRefPtr container,
                                     internal::LogBlockContainerLoadResult* result) {
+  MAYBE_INJECT_FIXED_LATENCY(FLAGS_log_block_manager_inject_latency_load_container_ms);
   // Process the records, building a container-local map for live blocks and
   // a list of dead blocks.
   //

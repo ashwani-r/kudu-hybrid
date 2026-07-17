@@ -779,6 +779,7 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   Status DeleteTableInCatalogs(const std::string& table_name,
                                bool modify_external_catalogs,
                                int32_t reserve_seconds = -1) KUDU_NO_EXPORT;
+  /// @endcond
 
   /// Recall a deleted but still reserved table.
   ///
@@ -789,8 +790,6 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   ///   table name if the parameter is empty string (i.e. "").
   /// @return Operation status.
   Status RecallTable(const std::string& table_id, const std::string& new_table_name = "");
-
-  /// @endcond
 
   /// Create a KuduTableAlterer object.
   ///

@@ -29,7 +29,7 @@ if(JavaVersion.current().isJava12Compatible()) {
 }
 
 repositories {
-  maven { url "https://clojars.org/repo/" }
+  maven { url = "https://clojars.org/repo/" }
 }
 
 dependencies {
@@ -58,7 +58,7 @@ task runJepsen(type: JavaExec) {
       sourceSets.test.clojure.srcDirs,
       sourceSets.test.runtimeClasspath,
       sourceSets.main.runtimeClasspath,
-  main = "clojure.main"
+  mainClass = "clojure.main"
   args = [
       "$projectDir/src/utils/kudu_test_runner.clj",
       "--masters=${masterNodes}",
@@ -69,8 +69,7 @@ task runJepsen(type: JavaExec) {
 }
 
 // We don't publish kudu-jepsen
-publish.enabled = false
-publishToMavenLocal.enabled = false
+disablePublishing()
 
 // SpotBugs doesn't work on Clojure.
 spotbugsMain.enabled = false

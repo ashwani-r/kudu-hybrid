@@ -516,11 +516,16 @@ struct MetricJsonOptions {
 // metrics in the Prometheus format.
 struct MetricPrometheusOptions {
   // Metrics are filtered per information in the 'filters' field,
-  // see the in-line MetricFilters's documentation for more details.
-  //
-  // NOTE: for Prometheus format metrics, the only applicable filtering
-  //       is by 'MetricFilters::entity_level' field.
+  // see the MetricFilters documentation for details. All filtering
+  // dimensions (entity type, entity ID, entity attributes, metric name
+  // substrings, and severity level) are applicable.
   MetricFilters filters;
+
+  // The hostname of the node serving the metrics. Attached as hostname="..."
+  // label to every metric line when both --metrics_prometheus_use_entity_labels
+  // and --metrics_prometheus_export_hostname are true.
+  // Empty when hostname is unavailable.
+  std::string hostname;
 };
 
 class MetricEntityPrototype {
@@ -777,7 +782,8 @@ class Metric : public RefCountedThreadSafe<Metric> {
   virtual Status WriteAsJson(JsonWriter* writer,
                              const MetricJsonOptions& opts) const = 0;
   // All metrics must be able to render themselves as Prometheus.
-  virtual Status WriteAsPrometheus(PrometheusWriter* writer, const std::string& prefix) const = 0;
+  virtual Status WriteAsPrometheus(PrometheusWriter* writer, const std::string& prefix,
+                                   const std::string& labels) const = 0;
 
   const MetricPrototype* prototype() const { return prototype_; }
 
@@ -1050,10 +1056,12 @@ class Gauge : public Metric {
   ~Gauge() override {}
   Status WriteAsJson(JsonWriter* w, const MetricJsonOptions& opts) const override;
 
-  Status WriteAsPrometheus(PrometheusWriter* w, const std::string& prefix) const override;
+  Status WriteAsPrometheus(PrometheusWriter* w, const std::string& prefix,
+                           const std::string& labels) const override;
  protected:
   virtual void WriteValue(JsonWriter* writer) const = 0;
-  virtual void WriteValue(PrometheusWriter* writer, const std::string& prefix) const = 0;
+  virtual void WriteValue(PrometheusWriter* writer, const std::string& prefix,
+                          const std::string& labels) const = 0;
  private:
   DISALLOW_COPY_AND_ASSIGN(Gauge);
 };
@@ -1072,12 +1080,14 @@ class StringGauge : public Gauge {
     return false;
   }
   void MergeFrom(const scoped_refptr<Metric>& other) override;
-  Status WriteAsPrometheus(PrometheusWriter* w, const std::string& prefix) const override;
+  Status WriteAsPrometheus(PrometheusWriter* w, const std::string& prefix,
+                           const std::string& labels) const override;
  protected:
   FRIEND_TEST(MetricsTest, SimpleStringGaugeForMergeTest);
   FRIEND_TEST(MetricsTest, StringGaugeForPrometheus);
   void WriteValue(JsonWriter* writer) const override;
-  void WriteValue(PrometheusWriter* writer, const std::string& prefix) const override;
+  void WriteValue(PrometheusWriter* writer, const std::string& prefix,
+                  const std::string& labels) const override;
   void FillUniqueValuesUnlocked();
   std::unordered_set<std::string> unique_values();
  private:
@@ -1107,7 +1117,8 @@ class MeanGauge : public Gauge {
 
  protected:
   void WriteValue(JsonWriter* writer) const override;
-  void WriteValue(PrometheusWriter* writer, const std::string& prefix) const override;
+  void WriteValue(PrometheusWriter* writer, const std::string& prefix,
+                  const std::string& labels) const override;
  private:
   double total_sum_;
   double total_count_;
@@ -1119,23 +1130,26 @@ class MeanGauge : public Gauge {
 template<typename T>
 void WriteValuePrometheus(PrometheusWriter* writer,
                           const std::string& prefix,
+                          const std::string& labels,
                           const char* proto_name,
                           const char* unit_name,
                           const T& value) {
-  static constexpr const char* const kFmt = "$0$1{unit_type=\"$2\"} $3\n";
+  static constexpr const char* const kFmt = "$0$1{$2unit_type=\"$3\"} $4\n";
 
   if constexpr (!std::is_arithmetic_v<T>) {
     // Non-arithmetic gauges aren't supported by Prometheus.
     return;
   }
 
+  const std::string label_prefix = PrometheusLabelPrefixForInjection(labels);
+
   // For a boolean gauge, convert false/true to 0/1 for Prometheus.
   if constexpr (std::is_same_v<T, bool>) {
     return writer->WriteEntry(
-        strings::Substitute(kFmt, prefix, proto_name, unit_name, value ? 1 : 0));
+        strings::Substitute(kFmt, prefix, proto_name, label_prefix, unit_name, value ? 1 : 0));
   } else {
     return writer->WriteEntry(
-        strings::Substitute(kFmt, prefix, proto_name, unit_name, value));
+        strings::Substitute(kFmt, prefix, proto_name, label_prefix, unit_name, value));
   }
 }
 
@@ -1208,9 +1222,11 @@ class AtomicGauge : public Gauge {
     writer->Value(value());
   }
 
-  void WriteValue(PrometheusWriter* writer,const std::string& prefix) const override {
+  void WriteValue(PrometheusWriter* writer, const std::string& prefix,
+                  const std::string& labels) const override {
     return WriteValuePrometheus(writer,
                                 prefix,
+                                labels,
                                 prototype_->name(),
                                 MetricUnit::Name(prototype_->unit()),
                                 value());
@@ -1307,9 +1323,11 @@ class FunctionGauge : public Gauge {
     writer->Value(value());
   }
 
-  void WriteValue(PrometheusWriter* writer, const std::string& prefix) const override {
+  void WriteValue(PrometheusWriter* writer, const std::string& prefix,
+                  const std::string& labels) const override {
     return WriteValuePrometheus(writer,
                                 prefix,
+                                labels,
                                 prototype_->name(),
                                 MetricUnit::Name(prototype_->unit()),
                                 value());
@@ -1435,7 +1453,8 @@ class Counter : public Metric {
   void IncrementBy(int64_t amount);
   Status WriteAsJson(JsonWriter* w, const MetricJsonOptions& opts) const override;
 
-  Status WriteAsPrometheus(PrometheusWriter* w, const std::string& prefix) const override;
+  Status WriteAsPrometheus(PrometheusWriter* w, const std::string& prefix,
+                           const std::string& labels) const override;
 
   bool IsUntouched() const override {
     return value() == 0;
@@ -1489,6 +1508,12 @@ class HistogramPrototype : public MetricPrototype {
 
 class Histogram : public Metric {
  public:
+  // Write HdrHistogram's data from the provided snapshot of HdrHistogram
+  // to 'snapshot_pb'. The data in 'snapshot' should not be changing behind
+  // the scenes while running this function.
+  static void HdrHistogramToPB(const HdrHistogram& snapshot,
+                               HistogramSnapshotPB* snapshot_pb);
+
   scoped_refptr<Metric> snapshot() const override {
     auto p = new Histogram(down_cast<const HistogramPrototype*>(prototype_), *histogram_);
     p->m_epoch_.store(m_epoch_);
@@ -1511,7 +1536,8 @@ class Histogram : public Metric {
 
   Status WriteAsJson(JsonWriter* w, const MetricJsonOptions& opts) const override;
 
-  Status WriteAsPrometheus(PrometheusWriter* w, const std::string& prefix) const override;
+  Status WriteAsPrometheus(PrometheusWriter* w, const std::string& prefix,
+                           const std::string& labels) const override;
 
   // Returns a snapshot of this histogram including the bucketed values and counts.
   Status GetHistogramSnapshotPB(HistogramSnapshotPB* snapshot_pb,

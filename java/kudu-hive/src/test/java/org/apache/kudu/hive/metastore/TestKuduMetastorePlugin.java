@@ -28,7 +28,6 @@ import java.util.UUID;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.metastore.DefaultPartitionExpressionProxy;
 import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
 import org.apache.hadoop.hive.metastore.MetaStoreEventListener;
@@ -41,7 +40,7 @@ import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.metastore.conf.MetastoreConf;
-import org.apache.hadoop.hive.metastore.utils.MetaStoreUtils;
+import org.apache.hadoop.hive.metastore.utils.MetaStoreServerUtils;
 import org.apache.thrift.TException;
 import org.junit.After;
 import org.junit.Test;
@@ -53,13 +52,18 @@ import org.apache.kudu.test.cluster.MiniKuduCluster;
 public class TestKuduMetastorePlugin {
   private static final Logger LOG = LoggerFactory.getLogger(TestKuduMetastorePlugin.class);
 
-  private HiveConf clientConf;
+  private Configuration clientConf;
   private HiveMetaStoreClient client;
   private MiniKuduCluster miniCluster;
 
   private EnvironmentContext masterContext() {
     return new EnvironmentContext(
         ImmutableMap.of(KuduMetastorePlugin.KUDU_MASTER_EVENT_KEY, "true"));
+  }
+
+  @SuppressWarnings("deprecation")
+  private Table fetchTable(Table table) throws TException {
+    return client.getTable(table.getDbName(), table.getTableName());
   }
 
   public void startCluster(boolean syncEnabled) throws Exception {
@@ -108,10 +112,11 @@ public class TestKuduMetastorePlugin {
     assertTrue(derbyLogFile.toFile().createNewFile());
     System.setProperty("derby.stream.error.file", derbyLogFile.toString());
 
-    int msPort = MetaStoreUtils.startMetaStore(hmsConf);
+    int msPort = MetaStoreServerUtils.startMetaStore(hmsConf);
 
-    clientConf = new HiveConf();
-    clientConf.setVar(HiveConf.ConfVars.METASTOREURIS, "thrift://localhost:" + msPort);
+    clientConf = MetastoreConf.newMetastoreConf(hmsConf);
+    clientConf.set(MetastoreConf.ConfVars.THRIFT_URIS.getVarname(),
+        "thrift://localhost:" + msPort);
 
     client = new HiveMetaStoreClient(clientConf);
 
@@ -258,11 +263,11 @@ public class TestKuduMetastorePlugin {
     Table initTable = newTable("table");
     client.createTable(initTable, masterContext());
     // Get the table from the HMS in case any translation occurred.
-    Table table = client.getTable(initTable.getDbName(), initTable.getTableName());
+    Table table = fetchTable(initTable);
     Table legacyTable = newLegacyTable("legacy_table");
     client.createTable(legacyTable, masterContext());
     // Get the table from the HMS in case any translation occurred.
-    legacyTable = client.getTable(legacyTable.getDbName(), legacyTable.getTableName());
+    legacyTable = fetchTable(legacyTable);
     try {
       // Check that altering the table succeeds.
       client.alter_table(table.getDbName(), table.getTableName(), table);
@@ -327,7 +332,7 @@ public class TestKuduMetastorePlugin {
         // Also change the location to avoid MetastoreDefaultTransformer validation
         // that exists in some Hive versions.
         alteredTable.getSd().setLocation(String.format("%s/%s/%s",
-            clientConf.get(HiveConf.ConfVars.METASTOREWAREHOUSE.varname),
+            clientConf.get(MetastoreConf.ConfVars.WAREHOUSE.getVarname()),
             table.getDbName(), table.getTableName()));
         alteredTable.putToParameters(KuduMetastorePlugin.EXTERNAL_TABLE_KEY, "FALSE");
         alteredTable.putToParameters(KuduMetastorePlugin.EXTERNAL_PURGE_KEY, "FALSE");
@@ -341,7 +346,7 @@ public class TestKuduMetastorePlugin {
         // Also change the location to avoid MetastoreDefaultTransformer validation
         // that exists in some Hive versions.
         alteredTable.getSd().setLocation(String.format("%s/%s/%s",
-            clientConf.get(HiveConf.ConfVars.METASTOREWAREHOUSE.varname),
+            clientConf.get(MetastoreConf.ConfVars.WAREHOUSE.getVarname()),
             table.getDbName(), table.getTableName()));
         alteredTable.putToParameters(KuduMetastorePlugin.EXTERNAL_PURGE_KEY, "FALSE");
         client.alter_table(table.getDbName(), table.getTableName(), alteredTable);
@@ -357,7 +362,7 @@ public class TestKuduMetastorePlugin {
         // Also change the location to avoid MetastoreDefaultTransformer validation
         // that exists in some Hive versions.
         alteredTable.getSd().setLocation(String.format("%s/%s/%s",
-            clientConf.get(HiveConf.ConfVars.METASTOREWAREHOUSE.varname),
+            clientConf.get(MetastoreConf.ConfVars.WAREHOUSE.getVarname()),
             table.getDbName(), table.getTableName()));
         alteredTable.setTableType(TableType.EXTERNAL_TABLE.toString());
         alteredTable.putToParameters(KuduMetastorePlugin.EXTERNAL_TABLE_KEY, "TRUE");
@@ -376,7 +381,7 @@ public class TestKuduMetastorePlugin {
         // Also change the location to avoid MetastoreDefaultTransformer validation
         // that exists in some Hive versions.
         alteredTable.getSd().setLocation(String.format("%s/%s/%s",
-            clientConf.get(HiveConf.ConfVars.METASTOREWAREHOUSE.varname),
+            clientConf.get(MetastoreConf.ConfVars.WAREHOUSE.getVarname()),
             table.getDbName(), table.getTableName()));
         client.alter_table(table.getDbName(), table.getTableName(), alteredTable);
       }
@@ -391,7 +396,7 @@ public class TestKuduMetastorePlugin {
         // Also change the location to avoid MetastoreDefaultTransformer validation
         // that exists in some Hive versions.
         alteredTable.getSd().setLocation(String.format("%s/%s/%s",
-            clientConf.get(HiveConf.ConfVars.METASTOREWAREHOUSE.varname),
+            clientConf.get(MetastoreConf.ConfVars.WAREHOUSE.getVarname()),
             table.getDbName(), table.getTableName()));
         client.alter_table(table.getDbName(), table.getTableName(), alteredTable);
       }
@@ -401,7 +406,7 @@ public class TestKuduMetastorePlugin {
       // Also change the location to avoid MetastoreDefaultTransformer validation
       // that exists in some Hive versions.
       table.getSd().setLocation(String.format("%s/%s/%s",
-          clientConf.get(HiveConf.ConfVars.METASTOREWAREHOUSE.varname),
+          clientConf.get(MetastoreConf.ConfVars.WAREHOUSE.getVarname()),
           table.getDbName(), table.getTableName()));
       try {
         client.alter_table(table.getDbName(), table.getTableName(), table);
@@ -448,7 +453,7 @@ public class TestKuduMetastorePlugin {
       table = initTable.deepCopy();
       table.getParameters().clear();
       client.createTable(table);
-      table = client.getTable(table.getDbName(), table.getTableName());
+      table = fetchTable(table);
       try {
 
         // Try to alter the table and add a Kudu table ID.
@@ -506,7 +511,7 @@ public class TestKuduMetastorePlugin {
       table.putToParameters(KuduMetastorePlugin.EXTERNAL_TABLE_KEY, "TRUE");
       table.putToParameters(KuduMetastorePlugin.EXTERNAL_PURGE_KEY, "FALSE");
       client.createTable(table);
-      table = client.getTable(table.getDbName(), table.getTableName());
+      table = fetchTable(table);
       try {
         client.alter_table(table.getDbName(), table.getTableName(), table);
       } finally {
@@ -522,7 +527,7 @@ public class TestKuduMetastorePlugin {
     Table table = newLegacyTable("legacy_table");
     client.createTable(table);
     // Get the table from the HMS in case any translation occurred.
-    table = client.getTable(table.getDbName(), table.getTableName());
+    table = fetchTable(table);
 
     // Check that altering legacy table's schema succeeds.
     {
@@ -634,7 +639,7 @@ public class TestKuduMetastorePlugin {
     Table table = newTable("table");
     client.createTable(table);
     // Get the table from the HMS in case any translation occurred.
-    table = client.getTable(table.getDbName(), table.getTableName());
+    table = fetchTable(table);
 
     // A Kudu table should should be allowed to be altered via Hive.
     // Add a column to the original table.

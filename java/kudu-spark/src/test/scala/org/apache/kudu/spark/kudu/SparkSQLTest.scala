@@ -189,7 +189,7 @@ class SparkSQLTest extends KuduTestSuite with Matchers {
     val testTable = kuduClient.createTable(testTableName, schema, tableOptions)
 
     val kuduSession = kuduClient.newSession()
-    val chars = List('a', 'b', '乕', Char.MaxValue, '\u0000')
+    val chars = List('a', 'b', 0x4e55.toChar, Char.MaxValue, '\u0000')
     val keys = for {
       x <- chars
       y <- chars

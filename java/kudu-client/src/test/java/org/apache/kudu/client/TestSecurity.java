@@ -34,6 +34,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.stumbleupon.async.Deferred;
 import org.hamcrest.CoreMatchers;
+import org.hamcrest.MatcherAssert;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -179,7 +180,7 @@ public class TestSecurity {
         Assert.fail("should not have been able to connect to a secure cluster " +
             "with no credentials");
       } catch (NonRecoverableException e) {
-        Assert.assertThat(e.getMessage(), CoreMatchers.containsString(
+        MatcherAssert.assertThat(e.getMessage(), CoreMatchers.containsString(
             "server requires authentication, but client does not have " +
             "Kerberos credentials (tgt). Authentication tokens were not used " +
             "because no token is available"));
@@ -239,7 +240,7 @@ public class TestSecurity {
         Assert.fail("should not have been able to connect to a secure cluster " +
             "with no credentials");
       } catch (NonRecoverableException e) {
-        Assert.assertThat(e.getMessage(), CoreMatchers.containsString(
+        MatcherAssert.assertThat(e.getMessage(), CoreMatchers.containsString(
             "server requires authentication, but client does not have " +
             "Kerberos credentials (tgt). Authentication tokens were not used " +
             "because no TLS certificates are trusted by the client"));
@@ -346,7 +347,7 @@ public class TestSecurity {
         checkClientCanReconnect(client);
       }
     }
-    Assert.assertThat(cla.getAppendedText(), CoreMatchers.containsString(
+    MatcherAssert.assertThat(cla.getAppendedText(), CoreMatchers.containsString(
         "Successfully refreshed Kerberos credentials from ticket cache"));
   }
 
@@ -367,7 +368,7 @@ public class TestSecurity {
           "server requires authentication, but " +
           "client Kerberos credentials (TGT) have expired");
     }
-    Assert.assertThat(cla.getAppendedText(), CoreMatchers.containsString(
+    MatcherAssert.assertThat(cla.getAppendedText(), CoreMatchers.containsString(
         "found that the new Kerberos principal test-user@KRBTEST.COM " +
         "did not match the original principal test-admin@KRBTEST.COM"));
   }
@@ -414,9 +415,9 @@ public class TestSecurity {
           "client Kerberos credentials (TGT) have expired");
     }
     // Note: this depends on DEBUG-level org.apache.kudu.client logging.
-    Assert.assertThat(cla.getAppendedText(), CoreMatchers.containsString(
+    MatcherAssert.assertThat(cla.getAppendedText(), CoreMatchers.containsString(
         "Using caller-provided subject with Kerberos principal test-admin@KRBTEST.COM."));
-    Assert.assertThat(cla.getAppendedText(), CoreMatchers.containsString(
+    MatcherAssert.assertThat(cla.getAppendedText(), CoreMatchers.containsString(
         "Caller-provided Subject has a Kerberos ticket that is about to expire"));
   }
 
@@ -455,7 +456,7 @@ public class TestSecurity {
       }
     }
     // Note: this depends on DEBUG-level org.apache.kudu.client logging.
-    Assert.assertThat(cla.getAppendedText(), CoreMatchers.containsString(
+    MatcherAssert.assertThat(cla.getAppendedText(), CoreMatchers.containsString(
         "Using caller-provided subject with Kerberos principal test-admin@KRBTEST.COM."));
   }
 
@@ -494,9 +495,9 @@ public class TestSecurity {
             getBasicSchema(), getBasicCreateTableOptions());
         Assert.fail("client should not be able to connect to any master");
       } catch (NonRecoverableException e) {
-        Assert.assertThat(e.getMessage(), CoreMatchers.containsString(
+        MatcherAssert.assertThat(e.getMessage(), CoreMatchers.containsString(
             "unable to verify identity of peer"));
-        Assert.assertThat(e.getMessage(), CoreMatchers.containsString(kvm.msg));
+        MatcherAssert.assertThat(e.getMessage(), CoreMatchers.containsString(kvm.msg));
       }
     }
   }
@@ -512,7 +513,7 @@ public class TestSecurity {
           getBasicCreateTableOptions());
       Assert.fail("default client shouldn't be able to connect to the cluster.");
     } catch (NonRecoverableException e) {
-      Assert.assertThat(e.getMessage(), CoreMatchers.containsString(
+      MatcherAssert.assertThat(e.getMessage(), CoreMatchers.containsString(
           "this client is not authenticated"
       ));
     }
@@ -534,7 +535,7 @@ public class TestSecurity {
           getBasicSchema(), getBasicCreateTableOptions());
       Assert.fail("client shouldn't be able to connect to the cluster.");
     } catch (NonRecoverableException e) {
-      Assert.assertThat(e.getMessage(), CoreMatchers.containsString(
+      MatcherAssert.assertThat(e.getMessage(), CoreMatchers.containsString(
           "client requires authentication, but server does not have Kerberos enabled"
       ));
     }
@@ -554,7 +555,7 @@ public class TestSecurity {
           getBasicSchema(), getBasicCreateTableOptions());
       Assert.fail("client shouldn't be able to connect to the cluster.");
     } catch (NonRecoverableException e) {
-      Assert.assertThat(e.getMessage(), CoreMatchers.containsString(
+      MatcherAssert.assertThat(e.getMessage(), CoreMatchers.containsString(
           "server does not support required TLS encryption"
       ));
     }

@@ -38,6 +38,19 @@ ext {
   mavenPublishUrl = propertyWithDefault("mavenPublishUrl", "")
   mavenUsername = propertyWithDefault("mavenUsername", "")
   mavenPassword = propertyWithDefault("mavenPassword", "")
+
+  disablePublishing = {
+    // Disable both lifecycle publish tasks and per-publication tasks. Disabling
+    // only the lifecycle tasks still lets their dependencies publish artifacts.
+    tasks.matching { task ->
+      task.name == "publish" ||
+          task.name == "publishToMavenLocal" ||
+          task.name.startsWith("publishAllPublicationsTo") ||
+          (task.name.startsWith("publish") && task.name.contains("PublicationTo"))
+    }.configureEach {
+      enabled = false
+    }
+  }
 }
 
 publishing {
@@ -45,12 +58,12 @@ publishing {
     maven(MavenPublication) {
       from components.java
 
-      groupId "org.apache.kudu"
-      version "${project.version}"
+      groupId = "org.apache.kudu"
+      version = "${project.version}"
 
       // Adjust the artifact names to include the spark and scala base versions.
       if (["kudu-backup", "kudu-spark"].contains(project.name)) {
-        artifactId = "${project.archivesBaseName}${versions.sparkBase}_${versions.scalaBase}"
+        artifactId = "${project.name}${versions.sparkBase}_${versions.scalaBase}"
       }
 
       if (project.name.equals("kudu-spark-tools")) {
@@ -160,17 +173,17 @@ publishing {
 
   repositories {
     maven {
-      url "${mavenPublishUrl}"
+      url = "${mavenPublishUrl}"
       credentials {
-        username "${mavenUsername}"
-        password "${mavenPassword}"
+        username = "${mavenUsername}"
+        password = "${mavenPassword}"
       }
     }
   }
 }
 
 signing {
-  required { shouldSign }
+  required = { shouldSign }
   if (shouldSign) {
     useGpgCmd() // Use gpg-agent to sign
   }
@@ -180,4 +193,3 @@ signing {
 
 // Add the install task to the "Upload" group so it's visible in the tasks output.
 publish.group = "Upload"
-
